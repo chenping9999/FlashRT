@@ -16,9 +16,9 @@ The minimum to run Qwen3.6-27B NVFP4 with K=6 speculative decode at
 ~134 tok/s decode on the short standard prompt. Step 1 is one-time; step 2 is the
 inference call.
 
-Install the Torch frontend extra before building/running Qwen. It
-includes the Qwen long-context runtime dependencies (`einops`,
-`triton>=3.2`, and `packaging`):
+Install the Torch frontend extra before building/running Qwen. The
+long-context runtime uses native FlashRT CUDA/CUTLASS kernels and does
+not require Triton/FLA Python kernels:
 
 ```bash
 pip install -e ".[torch]"
@@ -267,20 +267,20 @@ Long-context prefill uses the same TQ S=K forward in chunks (default
 chunk size = `MAX_Q_SEQ`, currently 2048) instead of one full forward
 per prompt token; full-attention layers use the vendored FA2 causal
 hdim=256 path for one q_seq=S attention call per chunk, and
-linear-attention layers use vendored FLA-style chunk/WY Gated DeltaNet
-scans for prefill chunks. Long-context NVFP4 defaults to the fused MLP
-gate/up GEMM when the checkpoint's gate/up scales allow it; the separate
-non-widen tile remains available by setting
+linear-attention layers use the native FlashRT WY/cuBLASLt Gated
+DeltaNet scan for prefill chunks. Long-context NVFP4 defaults to the
+fused MLP gate/up GEMM when the checkpoint's gate/up scales allow it;
+the separate non-widen tile remains available by setting
 `FLASHRT_QWEN36_FUSE_MLP_GATE_UP=0`.
 Linear-attention A/B projections use a deterministic fused AB96 BF16
 kernel in prefill chunks, and the default Gated DeltaNet prefill route
-uses the vendored FLA-style chunk/WY backend because it is currently
-much faster for large prompt chunks. Intermediate prompt chunks skip
-final-norm/lm-head logits entirely, and the final chunk computes logits
-only for the last prompt row. The large K-row logits workspace is
-allocated lazily only for explicit all-logits diagnostic calls. Set
-`FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND=native` to force the fully
-FlashRT-kernel direct-conv path for cleanup/bisection work.
+uses `FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND=wy_lt` with the f32 GEMM
+chunk-state update. Intermediate prompt chunks skip final-norm/lm-head
+logits entirely, and the final chunk computes logits only for the last
+prompt row. The large K-row logits workspace is allocated lazily only
+for explicit all-logits diagnostic calls. Set
+`FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND=native` to force the direct-conv
+FlashRT chunk scan for bisection.
 
 ## 5. TTFT (prefill latency)
 
@@ -294,23 +294,24 @@ export FLASHRT_QWEN36_LONG_CTX_ROUTE_MIN_SEQ=512
 ```
 
 Warm measurements on RTX 5090, `max_new_tokens=64`, repeated text
-prompt. The 128-token row uses BF16/spec because it is still the highest
-decode-throughput route there; 512 tokens and above use FP8-KV.
+prompt, one same-shape warmup generation followed by one timed
+generation. The 128-token row uses BF16/spec because it is still the
+highest decode-throughput route there; 512 tokens and above use FP8-KV.
 
 | prompt ctx | route | K | MTP tail | TTFT / prefill | prefill tok/s | decode ms | decode tok/s | spec attempts / accepts / full |
 |---:|---|---:|---:|---:|---:|---:|---:|---:|
-| 128 | BF16/spec | 6 | full | 2.72 s | 47 | 454.0 | 141.0 | 14 / 49 / 7 |
-| 512 | FP8-KV | 4 | 512 | 66.6 ms | 7,683 | 534.6 | 119.7 | 19 / 44 / 9 |
-| 1 K | FP8-KV | 5 | 2048 | 122.9 ms | 8,334 | 554.9 | 115.3 | 18 / 46 / 7 |
-| 2 K | FP8-KV | 6 | 2048 | 238.9 ms | 8,572 | 427.7 | 149.6 | 13 / 51 / 8 |
-| 4 K | FP8-KV | 3 | 512 | 333.4 ms | 12,285 | 561.9 | 113.9 | 21 / 43 / 10 |
-| 8 K | FP8-KV | 5 | 2048 | 749.7 ms | 10,926 | 406.2 | 157.5 | 13 / 50 / 6 |
-| 16 K | FP8-KV | 7 | 2048 | 1.55 s | 10,587 | 375.2 | 170.6 | 10 / 53 / 5 |
-| 32 K | FP8-KV | 6 | 2048 | 3.54 s | 9,262 | 406.4 | 157.5 | 12 / 52 / 5 |
-| 64 K | FP8-KV | 7 | 2048 | 9.11 s | 7,195 | 363.3 | 176.1 | 10 / 53 / 3 |
-| 128 K | FP8-KV | 7 | 2048 | 26.64 s | 4,920 | 415.9 | 153.9 | 11 / 52 / 2 |
-| 200 K | FP8-KV | 6 | 2048 | 56.81 s | 3,605 | 558.0 | 114.7 | 14 / 49 / 3 |
-| 256 K | FP8-KV | 6 | 2048 | 87.71 s | 2,989 | 493.5 | 129.7 | 12 / 51 / 4 |
+| 128 | BF16/spec | 6 | full | 2.686 s | 47.7 | 440.3 | 145.4 | 14 / 49 / 7 |
+| 512 | FP8-KV | 4 | 512 | 72.6 ms | 7,057 | 530.4 | 120.7 | 19 / 45 / 9 |
+| 1 K | FP8-KV | 5 | 2048 | 131.9 ms | 7,762 | 603.8 | 106.0 | 20 / 44 / 6 |
+| 2 K | FP8-KV | 6 | 2048 | 253.8 ms | 8,070 | 388.2 | 164.9 | 12 / 52 / 6 |
+| 4 K | FP8-KV | 3 | 512 | 350.9 ms | 11,673 | 494.0 | 129.6 | 19 / 45 / 11 |
+| 8 K | FP8-KV | 5 | 2048 | 774.2 ms | 10,581 | 482.4 | 132.7 | 16 / 48 / 4 |
+| 16 K | FP8-KV | 7 | 2048 | 1.570 s | 10,437 | 364.9 | 175.4 | 10 / 54 / 4 |
+| 32 K | FP8-KV | 6 | 2048 | 3.553 s | 9,223 | 425.4 | 150.4 | 13 / 51 / 5 |
+| 64 K | FP8-KV | 7 | 2048 | 9.133 s | 7,176 | 424.3 | 150.9 | 12 / 51 / 2 |
+| 128 K | FP8-KV | 7 | 2048 | 26.731 s | 4,903 | 405.0 | 158.0 | 11 / 52 / 3 |
+| 200 K | FP8-KV | 6 | 2048 | 56.921 s | 3,598 | 576.0 | 111.1 | 15 / 49 / 4 |
+| 256 K | FP8-KV | 6 | 2048 | 87.976 s | 2,980 | 442.7 | 144.6 | 11 / 52 / 4 |
 
 `decode tok/s` excludes TTFT and is the TPOT-style LLM serving metric.
 The low-TTFT FP8-KV route is available below 512 tokens, but it trades

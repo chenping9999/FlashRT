@@ -51,5 +51,26 @@ int silu_mul_merged_to_nvfp4_swizzled_bf16(
     int         cols,
     cudaStream_t stream);
 
+// Atomic-free grouped variant for large merged gate/up rows. Same math and
+// output layout as silu_mul_merged_to_nvfp4_swizzled_bf16.
+int silu_mul_merged_to_nvfp4_swizzled_grouped_bf16(
+    const void* merged_gate_up,
+    void*       packed,
+    void*       sf_swz,
+    int         rows,
+    int         cols,
+    cudaStream_t stream);
+
+// Same output as grouped_bf16, but each CTA covers 32 NVFP4 scale blocks
+// instead of 16. Kept separate for A/B because the optimal geometry is
+// shape- and GPU-dependent.
+int silu_mul_merged_to_nvfp4_swizzled_grouped32_bf16(
+    const void* merged_gate_up,
+    void*       packed,
+    void*       sf_swz,
+    int         rows,
+    int         cols,
+    cudaStream_t stream);
+
 }  // namespace kernels
 }  // namespace flash_rt

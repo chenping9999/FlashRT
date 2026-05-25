@@ -123,6 +123,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/kernels.h"
 #include "kernels/fusion.cuh"
 #include "kernels/causal_conv1d_qwen36.cuh"
+#include "kernels/linear_attention/gated_delta_wy_bf16.cuh"
 #include "kernels/gated_deltanet_qwen36.cuh"
 #include "kernels/qwen3_qkv_post_proc.cuh"
 #include "kernels/silu_mul_to_nvfp4_swizzled.cuh"
@@ -2144,8 +2145,9 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("stream") = 0);
 
     // ------------------------------------------------------------------
-    //  FP8 block-128 dequantization + GEMM (Phase 2.2 / Path D)
-    //  Used by Qwen3.6-27B; see internal-docs/qwen36_fp8_block128_gemm_design.md
+    //  FP8 block-128 dequantization + GEMM.
+    //  Used by Qwen3.6-27B as a portable fallback when native
+    //  block-scaled FP8 GEMM is unavailable or not selected.
     //  All entries are additive — existing fp8_gemm_descale_* untouched.
     // ------------------------------------------------------------------
     m.def("fp8_block128_dequantize_to_bf16",
@@ -3933,6 +3935,22 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("B"), py::arg("S"), py::arg("conv_dim"), py::arg("k"),
         py::arg("apply_silu") = true, py::arg("stream") = 0);
 
+    m.def("causal_conv1d_qwen36_update_chunk_parallel_gqa_bf16",
+        [](uintptr_t x, uintptr_t w, uintptr_t bias,
+           uintptr_t q16, uintptr_t k16, uintptr_t v48, uintptr_t state,
+           int B, int S, int conv_dim, int k, bool apply_silu,
+           uintptr_t stream) {
+            flash_rt::kernels::causal_conv1d_qwen36_update_chunk_parallel_gqa_bf16(
+                to_ptr(x), to_ptr(w),
+                bias ? to_ptr(bias) : nullptr,
+                to_ptr(q16), to_ptr(k16), to_ptr(v48), to_ptr(state),
+                B, S, conv_dim, k, apply_silu, to_stream(stream));
+        },
+        py::arg("x"), py::arg("w"), py::arg("bias"),
+        py::arg("q16"), py::arg("k16"), py::arg("v48"), py::arg("state"),
+        py::arg("B"), py::arg("S"), py::arg("conv_dim"), py::arg("k"),
+        py::arg("apply_silu") = true, py::arg("stream") = 0);
+
     // Phase 4.4 — stream-invariant bf16 matvec for Qwen3.6 (replaces F.linear
     // / cuBLASLt for the small in_proj_a/b and the lm_head bf16 GEMM whose
     // per-stream / per-graph algo selection breaks CUDA Graph correctness).
@@ -3970,6 +3988,42 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         [](uintptr_t x, uintptr_t W_ab, uintptr_t out_ab,
            int M, uintptr_t stream) {
             flash_rt::kernels::bf16_matmul_qwen36_ab96_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<const __nv_bfloat16*>(W_ab),
+                reinterpret_cast<__nv_bfloat16*>(out_ab),
+                M, to_stream(stream));
+        },
+        py::arg("x"), py::arg("W_ab"), py::arg("out_ab"),
+        py::arg("M"), py::arg("stream") = 0);
+
+    m.def("bf16_matmul_qwen36_ab96_m4_bf16",
+        [](uintptr_t x, uintptr_t W_ab, uintptr_t out_ab,
+           int M, uintptr_t stream) {
+            flash_rt::kernels::bf16_matmul_qwen36_ab96_m4_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<const __nv_bfloat16*>(W_ab),
+                reinterpret_cast<__nv_bfloat16*>(out_ab),
+                M, to_stream(stream));
+        },
+        py::arg("x"), py::arg("W_ab"), py::arg("out_ab"),
+        py::arg("M"), py::arg("stream") = 0);
+
+    m.def("bf16_matmul_qwen36_ab96_m4_pair_bf16",
+        [](uintptr_t x, uintptr_t W_ab, uintptr_t out_ab,
+           int M, uintptr_t stream) {
+            flash_rt::kernels::bf16_matmul_qwen36_ab96_m4_pair_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<const __nv_bfloat16*>(W_ab),
+                reinterpret_cast<__nv_bfloat16*>(out_ab),
+                M, to_stream(stream));
+        },
+        py::arg("x"), py::arg("W_ab"), py::arg("out_ab"),
+        py::arg("M"), py::arg("stream") = 0);
+
+    m.def("bf16_matmul_qwen36_ab96_lt_bf16",
+        [](uintptr_t x, uintptr_t W_ab, uintptr_t out_ab,
+           int M, uintptr_t stream) {
+            flash_rt::kernels::bf16_matmul_qwen36_ab96_lt_bf16(
                 reinterpret_cast<const __nv_bfloat16*>(x),
                 reinterpret_cast<const __nv_bfloat16*>(W_ab),
                 reinterpret_cast<__nv_bfloat16*>(out_ab),
@@ -4305,6 +4359,667 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("S"), py::arg("num_v_heads"),
         py::arg("a_stride"), py::arg("b_stride"),
         py::arg("use_qk_l2norm") = true, py::arg("stream") = 0);
+
+    m.def("qwen36_gdn_wy_norm_cumsum_bf16",
+        [](uintptr_t q16, uintptr_t k16, uintptr_t g,
+           uintptr_t q16_l2, uintptr_t k16_l2, uintptr_t g_cumsum,
+           int S, uintptr_t stream) {
+            flash_rt::kernels::qwen36_gdn_wy_norm_cumsum_bf16(
+                to_ptr(q16), to_ptr(k16), to_ptr(g),
+                to_ptr(q16_l2), to_ptr(k16_l2), to_ptr(g_cumsum),
+                S, to_stream(stream));
+        },
+        py::arg("q16"), py::arg("k16"), py::arg("g"),
+        py::arg("q16_l2"), py::arg("k16_l2"), py::arg("g_cumsum"),
+        py::arg("S"), py::arg("stream") = 0);
+
+    m.def("qwen36_gdn_wy_norm_cumsum_pack_q_bf16",
+        [](uintptr_t q16, uintptr_t k16, uintptr_t g,
+           uintptr_t q16_l2, uintptr_t k16_l2,
+           uintptr_t q_pack_hv, uintptr_t g_cumsum,
+           int S, uintptr_t stream) {
+            flash_rt::kernels::qwen36_gdn_wy_norm_cumsum_pack_q_bf16(
+                to_ptr(q16), to_ptr(k16), to_ptr(g),
+                to_ptr(q16_l2), to_ptr(k16_l2),
+                to_ptr(q_pack_hv), to_ptr(g_cumsum),
+                S, to_stream(stream));
+        },
+        py::arg("q16"), py::arg("k16"), py::arg("g"),
+        py::arg("q16_l2"), py::arg("k16_l2"),
+        py::arg("q_pack_hv"), py::arg("g_cumsum"),
+        py::arg("S"), py::arg("stream") = 0);
+
+    m.def("qwen36_gdn_wy_norm_cumsum_pack_qk_bf16",
+        [](uintptr_t q16, uintptr_t k16, uintptr_t g,
+           uintptr_t q16_l2, uintptr_t k16_l2,
+           uintptr_t q_pack_hv, uintptr_t k_pack_hk,
+           uintptr_t g_cumsum, int S, uintptr_t stream) {
+            flash_rt::kernels::qwen36_gdn_wy_norm_cumsum_pack_qk_bf16(
+                to_ptr(q16), to_ptr(k16), to_ptr(g),
+                to_ptr(q16_l2), to_ptr(k16_l2),
+                to_ptr(q_pack_hv), to_ptr(k_pack_hk),
+                to_ptr(g_cumsum), S, to_stream(stream));
+        },
+        py::arg("q16"), py::arg("k16"), py::arg("g"),
+        py::arg("q16_l2"), py::arg("k16_l2"),
+        py::arg("q_pack_hv"), py::arg("k_pack_hk"),
+        py::arg("g_cumsum"), py::arg("S"), py::arg("stream") = 0);
+
+    m.def("qwen36_gdn_wy_kkt_b64_bf16",
+        [](uintptr_t k16_l2, uintptr_t beta, uintptr_t g_cumsum,
+           uintptr_t A, int S, uintptr_t stream) {
+            flash_rt::kernels::qwen36_gdn_wy_kkt_b64_bf16(
+                to_ptr(k16_l2), to_ptr(beta), to_ptr(g_cumsum),
+                to_ptr(A), S, to_stream(stream));
+        },
+        py::arg("k16_l2"), py::arg("beta"), py::arg("g_cumsum"),
+        py::arg("A"), py::arg("S"), py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_kkt_b64_bf16_cublaslt",
+        [](uintptr_t k_l2, uintptr_t beta, uintptr_t g_cumsum,
+           uintptr_t k_pack, uintptr_t kkt_base, uintptr_t A,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::gdn_wy_kkt_b64_bf16_cublaslt(
+                to_ptr(k_l2), to_ptr(beta), to_ptr(g_cumsum),
+                to_ptr(k_pack), to_ptr(kkt_base), to_ptr(A),
+                S, num_k_heads, num_v_heads, head_dim, qk_group,
+                to_stream(stream));
+        },
+        py::arg("k_l2"), py::arg("beta"), py::arg("g_cumsum"),
+        py::arg("k_pack"), py::arg("kkt_base"), py::arg("A"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_kkt_b64_bf16_cublaslt_packed_k",
+        [](uintptr_t k_pack, uintptr_t beta, uintptr_t g_cumsum,
+           uintptr_t kkt_base, uintptr_t A,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_kkt_b64_bf16_cublaslt_packed_k(
+                    to_ptr(k_pack), to_ptr(beta), to_ptr(g_cumsum),
+                    to_ptr(kkt_base), to_ptr(A),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("k_pack"), py::arg("beta"), py::arg("g_cumsum"),
+        py::arg("kkt_base"), py::arg("A"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_kkt_b64_bf16_cublaslt_packed_k_only",
+        [](uintptr_t k_pack, uintptr_t kkt_base,
+           int S, int num_k_heads, int head_dim, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_kkt_b64_bf16_cublaslt_packed_k_only(
+                    to_ptr(k_pack), to_ptr(kkt_base),
+                    S, num_k_heads, head_dim, to_stream(stream));
+        },
+        py::arg("k_pack"), py::arg("kkt_base"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("head_dim"),
+        py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_kkt_b64_bf16_cublaslt_nogate",
+        [](uintptr_t k_l2, uintptr_t beta,
+           uintptr_t k_pack, uintptr_t kkt_base, uintptr_t A,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_kkt_b64_bf16_cublaslt_nogate(
+                    to_ptr(k_l2), to_ptr(beta), to_ptr(k_pack),
+                    to_ptr(kkt_base), to_ptr(A),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("k_l2"), py::arg("beta"),
+        py::arg("k_pack"), py::arg("kkt_base"), py::arg("A"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt",
+        [](uintptr_t k_l2, uintptr_t v, uintptr_t beta,
+           uintptr_t g_cumsum, uintptr_t Ai,
+           uintptr_t Ai_pack, uintptr_t rhs_w, uintptr_t rhs_u,
+           uintptr_t w_pack, uintptr_t u_pack,
+           uintptr_t w, uintptr_t u,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_recompute_wu_b64_bf16_cublaslt(
+                    to_ptr(k_l2), to_ptr(v), to_ptr(beta),
+                    to_ptr(g_cumsum), to_ptr(Ai),
+                    to_ptr(Ai_pack), to_ptr(rhs_w), to_ptr(rhs_u),
+                    to_ptr(w_pack), to_ptr(u_pack),
+                    to_ptr(w), to_ptr(u),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("k_l2"), py::arg("v"), py::arg("beta"),
+        py::arg("g_cumsum"), py::arg("Ai"),
+        py::arg("Ai_pack"), py::arg("rhs_w"), py::arg("rhs_u"),
+        py::arg("w_pack"), py::arg("u_pack"),
+        py::arg("w"), py::arg("u"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt_packed",
+        [](uintptr_t k_l2, uintptr_t v, uintptr_t beta,
+           uintptr_t g_cumsum, uintptr_t Ai,
+           uintptr_t Ai_pack, uintptr_t rhs_w, uintptr_t rhs_u,
+           uintptr_t w_pack, uintptr_t u_pack,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_recompute_wu_b64_bf16_cublaslt_packed(
+                    to_ptr(k_l2), to_ptr(v), to_ptr(beta),
+                    to_ptr(g_cumsum), to_ptr(Ai),
+                    to_ptr(Ai_pack), to_ptr(rhs_w), to_ptr(rhs_u),
+                    to_ptr(w_pack), to_ptr(u_pack),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("k_l2"), py::arg("v"), py::arg("beta"),
+        py::arg("g_cumsum"), py::arg("Ai"),
+        py::arg("Ai_pack"), py::arg("rhs_w"), py::arg("rhs_u"),
+        py::arg("w_pack"), py::arg("u_pack"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt_packed_rhs",
+        [](uintptr_t k_l2, uintptr_t v, uintptr_t beta,
+           uintptr_t g_cumsum, uintptr_t Ai_pack,
+           uintptr_t rhs_w, uintptr_t rhs_u,
+           uintptr_t w_pack, uintptr_t u_pack,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_recompute_wu_b64_bf16_cublaslt_packed_rhs(
+                    to_ptr(k_l2), to_ptr(v), to_ptr(beta),
+                    to_ptr(g_cumsum), to_ptr(Ai_pack),
+                    to_ptr(rhs_w), to_ptr(rhs_u),
+                    to_ptr(w_pack), to_ptr(u_pack),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("k_l2"), py::arg("v"), py::arg("beta"),
+        py::arg("g_cumsum"), py::arg("Ai_pack"),
+        py::arg("rhs_w"), py::arg("rhs_u"),
+        py::arg("w_pack"), py::arg("u_pack"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt_packed_rhs_nogate",
+        [](uintptr_t k_l2, uintptr_t v, uintptr_t beta,
+           uintptr_t g_cumsum, uintptr_t Ai_pack,
+           uintptr_t rhs_w, uintptr_t rhs_u,
+           uintptr_t w_pack, uintptr_t u_pack,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_recompute_wu_b64_bf16_cublaslt_packed_rhs_nogate(
+                    to_ptr(k_l2), to_ptr(v), to_ptr(beta),
+                    to_ptr(g_cumsum), to_ptr(Ai_pack),
+                    to_ptr(rhs_w), to_ptr(rhs_u),
+                    to_ptr(w_pack), to_ptr(u_pack),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("k_l2"), py::arg("v"), py::arg("beta"),
+        py::arg("g_cumsum"), py::arg("Ai_pack"),
+        py::arg("rhs_w"), py::arg("rhs_u"),
+        py::arg("w_pack"), py::arg("u_pack"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_solve_tril_b64_f32_parallel",
+        [](uintptr_t A, uintptr_t Ai, int S, int num_v_heads,
+           uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_solve_tril_b64_f32_parallel(
+                    to_ptr(A), to_ptr(Ai), S, num_v_heads,
+                    to_stream(stream));
+        },
+        py::arg("A"), py::arg("Ai"), py::arg("S"),
+        py::arg("num_v_heads"), py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_solve_tril_b64_f32_parallel_pack",
+        [](uintptr_t A, uintptr_t Ai, uintptr_t Ai_pack,
+           int S, int num_v_heads, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_solve_tril_b64_f32_parallel_pack(
+                    to_ptr(A), to_ptr(Ai), to_ptr(Ai_pack),
+                    S, num_v_heads, to_stream(stream));
+        },
+        py::arg("A"), py::arg("Ai"), py::arg("Ai_pack"),
+        py::arg("S"), py::arg("num_v_heads"), py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_solve_tril_b64_f32_fused_pack",
+        [](uintptr_t A, uintptr_t Ai, uintptr_t Ai_pack,
+           int S, int num_v_heads, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_solve_tril_b64_f32_fused_pack(
+                    to_ptr(A), to_ptr(Ai), to_ptr(Ai_pack),
+                    S, num_v_heads, to_stream(stream));
+        },
+        py::arg("A"), py::arg("Ai"), py::arg("Ai_pack"),
+        py::arg("S"), py::arg("num_v_heads"), py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_solve_tril_b64_f32_fused_pack_only",
+        [](uintptr_t A, uintptr_t Ai_pack,
+           int S, int num_v_heads, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_solve_tril_b64_f32_fused_pack_only(
+                    to_ptr(A), to_ptr(Ai_pack),
+                    S, num_v_heads, to_stream(stream));
+        },
+        py::arg("A"), py::arg("Ai_pack"),
+        py::arg("S"), py::arg("num_v_heads"), py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_solve_tril_b64_from_kkt_pack_only",
+        [](uintptr_t kkt_base, uintptr_t beta, uintptr_t g_cumsum,
+           uintptr_t Ai_pack,
+           int S, int num_k_heads, int num_v_heads, int qk_group,
+           uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_solve_tril_b64_from_kkt_pack_only(
+                    to_ptr(kkt_base), to_ptr(beta), to_ptr(g_cumsum),
+                    to_ptr(Ai_pack),
+                    S, num_k_heads, num_v_heads, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("kkt_base"), py::arg("beta"), py::arg("g_cumsum"),
+        py::arg("Ai_pack"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("qk_group"), py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_output_o_b64_bf16_cublaslt",
+        [](uintptr_t q_l2, uintptr_t k_l2, uintptr_t v_new,
+           uintptr_t h0, uintptr_t g_cumsum,
+           uintptr_t q_pack, uintptr_t k_pack_hv, uintptr_t v_pack,
+           uintptr_t qk_base, uintptr_t local_a_pack,
+           uintptr_t qh_pack, uintptr_t local_pack, uintptr_t out,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_output_o_b64_bf16_cublaslt(
+                    to_ptr(q_l2), to_ptr(k_l2), to_ptr(v_new),
+                    to_ptr(h0), to_ptr(g_cumsum),
+                    to_ptr(q_pack), to_ptr(k_pack_hv), to_ptr(v_pack),
+                    to_ptr(qk_base), to_ptr(local_a_pack),
+                    to_ptr(qh_pack), to_ptr(local_pack), to_ptr(out),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("q_l2"), py::arg("k_l2"), py::arg("v_new"),
+        py::arg("h0"), py::arg("g_cumsum"),
+        py::arg("q_pack"), py::arg("k_pack_hv"), py::arg("v_pack"),
+        py::arg("qk_base"), py::arg("local_a_pack"),
+        py::arg("qh_pack"), py::arg("local_pack"), py::arg("out"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_output_o_b64_bf16_cublaslt_packed_k",
+        [](uintptr_t q_l2, uintptr_t k_pack_hv, uintptr_t v_new,
+           uintptr_t h0, uintptr_t g_cumsum,
+           uintptr_t q_pack, uintptr_t v_pack,
+           uintptr_t qk_base, uintptr_t local_a_pack,
+           uintptr_t qh_pack, uintptr_t local_pack, uintptr_t out,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_output_o_b64_bf16_cublaslt_packed_k(
+                    to_ptr(q_l2), to_ptr(k_pack_hv), to_ptr(v_new),
+                    to_ptr(h0), to_ptr(g_cumsum),
+                    to_ptr(q_pack), to_ptr(v_pack),
+                    to_ptr(qk_base), to_ptr(local_a_pack),
+                    to_ptr(qh_pack), to_ptr(local_pack), to_ptr(out),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("q_l2"), py::arg("k_pack_hv"), py::arg("v_new"),
+        py::arg("h0"), py::arg("g_cumsum"),
+        py::arg("q_pack"), py::arg("v_pack"),
+        py::arg("qk_base"), py::arg("local_a_pack"),
+        py::arg("qh_pack"), py::arg("local_pack"), py::arg("out"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_output_o_b64_bf16_cublaslt_packed_kv",
+        [](uintptr_t q_l2, uintptr_t k_pack_hv, uintptr_t v_pack,
+           uintptr_t h0, uintptr_t g_cumsum,
+           uintptr_t q_pack, uintptr_t qk_base,
+           uintptr_t local_a_pack, uintptr_t qh_pack,
+           uintptr_t local_pack, uintptr_t out,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_output_o_b64_bf16_cublaslt_packed_kv(
+                    to_ptr(q_l2), to_ptr(k_pack_hv), to_ptr(v_pack),
+                    to_ptr(h0), to_ptr(g_cumsum),
+                    to_ptr(q_pack), to_ptr(qk_base), to_ptr(local_a_pack),
+                    to_ptr(qh_pack), to_ptr(local_pack), to_ptr(out),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("q_l2"), py::arg("k_pack_hv"), py::arg("v_pack"),
+        py::arg("h0"), py::arg("g_cumsum"),
+        py::arg("q_pack"), py::arg("qk_base"),
+        py::arg("local_a_pack"), py::arg("qh_pack"),
+        py::arg("local_pack"), py::arg("out"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_output_o_b64_bf16_cublaslt_packed_qkv",
+        [](uintptr_t q_pack, uintptr_t k_pack_hv, uintptr_t v_pack,
+           uintptr_t h0, uintptr_t g_cumsum,
+           uintptr_t qk_base, uintptr_t local_a_pack,
+           uintptr_t qh_pack, uintptr_t local_pack, uintptr_t out,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_output_o_b64_bf16_cublaslt_packed_qkv(
+                    to_ptr(q_pack), to_ptr(k_pack_hv), to_ptr(v_pack),
+                    to_ptr(h0), to_ptr(g_cumsum),
+                    to_ptr(qk_base), to_ptr(local_a_pack),
+                    to_ptr(qh_pack), to_ptr(local_pack), to_ptr(out),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("q_pack"), py::arg("k_pack_hv"), py::arg("v_pack"),
+        py::arg("h0"), py::arg("g_cumsum"),
+        py::arg("qk_base"), py::arg("local_a_pack"),
+        py::arg("qh_pack"), py::arg("local_pack"), py::arg("out"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
+    // FLA-style hand-tuned recompute_wu. Fuses pack_rhs + 2 cublasLt mmas
+    // into a single kernel; only writes w_pack / u_pack.
+    m.def("linear_attn_gdn_wy_recompute_wu_b64_bf16_mma_fla",
+        [](uintptr_t k_l2, uintptr_t v, uintptr_t beta, uintptr_t g_cumsum,
+           uintptr_t Ai_pack, uintptr_t w_pack, uintptr_t u_pack,
+           int S, int num_k_heads, int num_v_heads, int head_dim,
+           int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_recompute_wu_b64_bf16_mma_fla(
+                    to_ptr(k_l2), to_ptr(v), to_ptr(beta), to_ptr(g_cumsum),
+                    to_ptr(Ai_pack), to_ptr(w_pack), to_ptr(u_pack),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("k_l2"), py::arg("v"), py::arg("beta"), py::arg("g_cumsum"),
+        py::arg("Ai_pack"), py::arg("w_pack"), py::arg("u_pack"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
+    // FLA-style hand-tuned output_o. Drop-in for output_o packed_qkv but
+    // no scratch buffers needed.
+    m.def("linear_attn_gdn_wy_output_o_b64_bf16_mma_fla",
+        [](uintptr_t q_pack, uintptr_t k_pack_hv, uintptr_t v_pack,
+           uintptr_t h, uintptr_t g_cumsum, uintptr_t out,
+           int S, int num_v_heads, int head_dim, double scale,
+           uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_output_o_b64_bf16_mma_fla(
+                    to_ptr(q_pack), to_ptr(k_pack_hv), to_ptr(v_pack),
+                    to_ptr(h), to_ptr(g_cumsum), to_ptr(out),
+                    S, num_v_heads, head_dim,
+                    static_cast<float>(scale), to_stream(stream));
+        },
+        py::arg("q_pack"), py::arg("k_pack_hv"), py::arg("v_pack"),
+        py::arg("h"), py::arg("g_cumsum"), py::arg("out"),
+        py::arg("S"), py::arg("num_v_heads"), py::arg("head_dim"),
+        py::arg("scale"),
+        py::arg("stream") = 0);
+
+    // Raw-K variant: output_o reads k_l2 (S, num_k_heads, head_dim)
+    // directly and does GQA expansion in-kernel.
+    m.def("linear_attn_gdn_wy_output_o_b64_bf16_mma_fla_rawk",
+        [](uintptr_t q_pack, uintptr_t k_l2, uintptr_t v_pack,
+           uintptr_t h, uintptr_t g_cumsum, uintptr_t out,
+           int S, int num_k_heads, int num_v_heads, int head_dim,
+           int qk_group, double scale, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_output_o_b64_bf16_mma_fla_rawk(
+                    to_ptr(q_pack), to_ptr(k_l2), to_ptr(v_pack),
+                    to_ptr(h), to_ptr(g_cumsum), to_ptr(out),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    static_cast<float>(scale), to_stream(stream));
+        },
+        py::arg("q_pack"), py::arg("k_l2"), py::arg("v_pack"),
+        py::arg("h"), py::arg("g_cumsum"), py::arg("out"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"), py::arg("scale"),
+        py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt",
+        [](uintptr_t k_l2, uintptr_t u, uintptr_t w,
+           uintptr_t g_cumsum, uintptr_t state,
+           uintptr_t h0, uintptr_t v_new,
+           uintptr_t k_pack_hv, uintptr_t w_pack, uintptr_t u_pack,
+           uintptr_t wh_pack, uintptr_t decayed_v_pack,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_chunk_h_b64_bf16_cublaslt(
+                    to_ptr(k_l2), to_ptr(u), to_ptr(w), to_ptr(g_cumsum),
+                    to_ptr(state), to_ptr(h0), to_ptr(v_new),
+                    to_ptr(k_pack_hv), to_ptr(w_pack), to_ptr(u_pack),
+                    to_ptr(wh_pack), to_ptr(decayed_v_pack),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("k_l2"), py::arg("u"), py::arg("w"),
+        py::arg("g_cumsum"), py::arg("state"),
+        py::arg("h0"), py::arg("v_new"),
+        py::arg("k_pack_hv"), py::arg("w_pack"), py::arg("u_pack"),
+        py::arg("wh_pack"), py::arg("decayed_v_pack"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_f32state",
+        [](uintptr_t k_l2, uintptr_t u, uintptr_t w,
+           uintptr_t g_cumsum, uintptr_t state,
+           uintptr_t h0, uintptr_t v_new,
+           uintptr_t k_pack_hv, uintptr_t w_pack, uintptr_t u_pack,
+           uintptr_t wh_pack, uintptr_t decayed_v_pack,
+           uintptr_t state_f32, uintptr_t delta_f32,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_chunk_h_b64_bf16_cublaslt_f32state(
+                    to_ptr(k_l2), to_ptr(u), to_ptr(w), to_ptr(g_cumsum),
+                    to_ptr(state), to_ptr(h0), to_ptr(v_new),
+                    to_ptr(k_pack_hv), to_ptr(w_pack), to_ptr(u_pack),
+                    to_ptr(wh_pack), to_ptr(decayed_v_pack),
+                    to_ptr(state_f32), to_ptr(delta_f32),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("k_l2"), py::arg("u"), py::arg("w"),
+        py::arg("g_cumsum"), py::arg("state"),
+        py::arg("h0"), py::arg("v_new"),
+        py::arg("k_pack_hv"), py::arg("w_pack"), py::arg("u_pack"),
+        py::arg("wh_pack"), py::arg("decayed_v_pack"),
+        py::arg("state_f32"), py::arg("delta_f32"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_f32gemm",
+        [](uintptr_t k_l2, uintptr_t u, uintptr_t w,
+           uintptr_t g_cumsum, uintptr_t state,
+           uintptr_t h0, uintptr_t v_new,
+           uintptr_t k_pack_hv, uintptr_t w_pack, uintptr_t u_pack,
+           uintptr_t wh_pack, uintptr_t decayed_v_pack,
+           uintptr_t state_f32, uintptr_t chunk_f32, uintptr_t acc_f32,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_chunk_h_b64_bf16_cublaslt_f32gemm(
+                    to_ptr(k_l2), to_ptr(u), to_ptr(w), to_ptr(g_cumsum),
+                    to_ptr(state), to_ptr(h0), to_ptr(v_new),
+                    to_ptr(k_pack_hv), to_ptr(w_pack), to_ptr(u_pack),
+                    to_ptr(wh_pack), to_ptr(decayed_v_pack),
+                    to_ptr(state_f32), to_ptr(chunk_f32), to_ptr(acc_f32),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("k_l2"), py::arg("u"), py::arg("w"),
+        py::arg("g_cumsum"), py::arg("state"),
+        py::arg("h0"), py::arg("v_new"),
+        py::arg("k_pack_hv"), py::arg("w_pack"), py::arg("u_pack"),
+        py::arg("wh_pack"), py::arg("decayed_v_pack"),
+        py::arg("state_f32"), py::arg("chunk_f32"), py::arg("acc_f32"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_f32gemm_packed_wu",
+        [](uintptr_t k_l2, uintptr_t w_pack, uintptr_t u_pack,
+           uintptr_t g_cumsum, uintptr_t state,
+           uintptr_t h0, uintptr_t v_new,
+           uintptr_t k_pack_hv, uintptr_t decayed_v_pack,
+           uintptr_t state_f32, uintptr_t chunk_f32, uintptr_t acc_f32,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_chunk_h_b64_bf16_cublaslt_f32gemm_packed_wu(
+                    to_ptr(k_l2), to_ptr(w_pack), to_ptr(u_pack),
+                    to_ptr(g_cumsum), to_ptr(state), to_ptr(h0),
+                    to_ptr(v_new), to_ptr(k_pack_hv),
+                    to_ptr(decayed_v_pack), to_ptr(state_f32),
+                    to_ptr(chunk_f32), to_ptr(acc_f32),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("k_l2"), py::arg("w_pack"), py::arg("u_pack"),
+        py::arg("g_cumsum"), py::arg("state"),
+        py::arg("h0"), py::arg("v_new"),
+        py::arg("k_pack_hv"), py::arg("decayed_v_pack"),
+        py::arg("state_f32"), py::arg("chunk_f32"), py::arg("acc_f32"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu",
+        [](uintptr_t k_l2, uintptr_t w_pack, uintptr_t u_pack,
+           uintptr_t g_cumsum, uintptr_t state,
+           uintptr_t h0, uintptr_t v_new,
+           uintptr_t k_pack_hv, uintptr_t wh_pack,
+           uintptr_t decayed_v_pack,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu(
+                    to_ptr(k_l2), to_ptr(w_pack), to_ptr(u_pack),
+                    to_ptr(g_cumsum), to_ptr(state), to_ptr(h0),
+                    to_ptr(v_new), to_ptr(k_pack_hv), to_ptr(wh_pack),
+                    to_ptr(decayed_v_pack),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("k_l2"), py::arg("w_pack"), py::arg("u_pack"),
+        py::arg("g_cumsum"), py::arg("state"),
+        py::arg("h0"), py::arg("v_new"),
+        py::arg("k_pack_hv"), py::arg("wh_pack"),
+        py::arg("decayed_v_pack"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
+    // FLA-style mma.sync + cp.async chunk_h kernel.
+    // RAW input layout, head_dim must be 128. See .cuh for shape contract.
+    // v_new_packed and k_pack_hv are optional packed side outputs (pass 0 to skip).
+    m.def("linear_attn_gdn_wy_chunk_h_b64_bf16_mma_fla",
+        [](uintptr_t k_l2, uintptr_t w, uintptr_t u,
+           uintptr_t g_cumsum, uintptr_t state,
+           uintptr_t h_out, uintptr_t v_new,
+           uintptr_t v_new_packed, uintptr_t k_pack_hv,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_chunk_h_b64_bf16_mma_fla(
+                    to_ptr(k_l2), to_ptr(w), to_ptr(u),
+                    to_ptr(g_cumsum), to_ptr(state),
+                    to_ptr(h_out), to_ptr(v_new),
+                    to_ptr(v_new_packed), to_ptr(k_pack_hv),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("k_l2"), py::arg("w"), py::arg("u"),
+        py::arg("g_cumsum"), py::arg("state"),
+        py::arg("h_out"), py::arg("v_new"),
+        py::arg("v_new_packed"), py::arg("k_pack_hv"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
+    m.def("qwen36_gdn_wy_solve_tril_b64_f32",
+        [](uintptr_t A, uintptr_t Ai, int S, uintptr_t stream) {
+            flash_rt::kernels::qwen36_gdn_wy_solve_tril_b64_f32(
+                to_ptr(A), to_ptr(Ai), S, to_stream(stream));
+        },
+        py::arg("A"), py::arg("Ai"), py::arg("S"),
+        py::arg("stream") = 0);
+
+    m.def("qwen36_gdn_wy_recompute_wu_b64_bf16",
+        [](uintptr_t k16_l2, uintptr_t v48, uintptr_t beta,
+           uintptr_t g_cumsum, uintptr_t Ai,
+           uintptr_t w48, uintptr_t u48,
+           int S, uintptr_t stream) {
+            flash_rt::kernels::qwen36_gdn_wy_recompute_wu_b64_bf16(
+                to_ptr(k16_l2), to_ptr(v48), to_ptr(beta),
+                to_ptr(g_cumsum), to_ptr(Ai),
+                to_ptr(w48), to_ptr(u48),
+                S, to_stream(stream));
+        },
+        py::arg("k16_l2"), py::arg("v48"), py::arg("beta"),
+        py::arg("g_cumsum"), py::arg("Ai"),
+        py::arg("w48"), py::arg("u48"),
+        py::arg("S"), py::arg("stream") = 0);
+
+    m.def("qwen36_gdn_wy_chunk_h_b64_bf16",
+        [](uintptr_t k16_l2, uintptr_t u48, uintptr_t w48,
+           uintptr_t g_cumsum, uintptr_t state,
+           uintptr_t h0, uintptr_t v_new,
+           int S, uintptr_t stream) {
+            flash_rt::kernels::qwen36_gdn_wy_chunk_h_b64_bf16(
+                to_ptr(k16_l2), to_ptr(u48), to_ptr(w48),
+                to_ptr(g_cumsum), to_ptr(state),
+                to_ptr(h0), to_ptr(v_new),
+                S, to_stream(stream));
+        },
+        py::arg("k16_l2"), py::arg("u48"), py::arg("w48"),
+        py::arg("g_cumsum"), py::arg("state"),
+        py::arg("h0"), py::arg("v_new"),
+        py::arg("S"), py::arg("stream") = 0);
+
+    m.def("qwen36_gdn_wy_output_o_b64_bf16",
+        [](uintptr_t q16_l2, uintptr_t k16_l2, uintptr_t v_new,
+           uintptr_t h0, uintptr_t g_cumsum, uintptr_t out,
+           int S, uintptr_t stream) {
+            flash_rt::kernels::qwen36_gdn_wy_output_o_b64_bf16(
+                to_ptr(q16_l2), to_ptr(k16_l2), to_ptr(v_new),
+                to_ptr(h0), to_ptr(g_cumsum), to_ptr(out),
+                S, to_stream(stream));
+        },
+        py::arg("q16_l2"), py::arg("k16_l2"), py::arg("v_new"),
+        py::arg("h0"), py::arg("g_cumsum"), py::arg("out"),
+        py::arg("S"), py::arg("stream") = 0);
 
 #ifdef ENABLE_CUTLASS_SM120_BLOCK_FP8
     // Path B: native CUTLASS block-128 FP8 GEMM on SM120a — no
@@ -4648,6 +5363,25 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
            float alpha,
            uintptr_t stream) {
             flash_rt::gemm::fp4_w4a16_gemm_sm120_bf16out_widen(
+                to_ptr(A_packed), to_ptr(B_packed), to_ptr(D),
+                M, N, K,
+                to_ptr(SFA), to_ptr(SFB),
+                alpha,
+                to_stream(stream));
+        },
+        py::arg("A_packed"), py::arg("B_packed"), py::arg("D"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("SFA"), py::arg("SFB"),
+        py::arg("alpha") = 1.0f,
+        py::arg("stream") = 0);
+
+    m.def("fp4_w4a16_gemm_sm120_bf16out_pingpong",
+        [](uintptr_t A_packed, uintptr_t B_packed, uintptr_t D,
+           int M, int N, int K,
+           uintptr_t SFA, uintptr_t SFB,
+           float alpha,
+           uintptr_t stream) {
+            flash_rt::gemm::fp4_w4a16_gemm_sm120_bf16out_pingpong(
                 to_ptr(A_packed), to_ptr(B_packed), to_ptr(D),
                 M, N, K,
                 to_ptr(SFA), to_ptr(SFB),
@@ -5049,6 +5783,32 @@ N must be a multiple of 32; K must be a multiple of 64.
            uintptr_t packed, uintptr_t sf_swz,
            int rows, int cols, uintptr_t stream) -> int {
             return flash_rt::kernels::silu_mul_merged_to_nvfp4_swizzled_bf16(
+                to_ptr(merged_gate_up),
+                to_ptr(packed), to_ptr(sf_swz),
+                rows, cols, to_stream(stream));
+        },
+        py::arg("merged_gate_up"),
+        py::arg("packed"), py::arg("sf_swz"),
+        py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
+
+    m.def("silu_mul_merged_to_nvfp4_swizzled_grouped_bf16",
+        [](uintptr_t merged_gate_up,
+           uintptr_t packed, uintptr_t sf_swz,
+           int rows, int cols, uintptr_t stream) -> int {
+            return flash_rt::kernels::silu_mul_merged_to_nvfp4_swizzled_grouped_bf16(
+                to_ptr(merged_gate_up),
+                to_ptr(packed), to_ptr(sf_swz),
+                rows, cols, to_stream(stream));
+        },
+        py::arg("merged_gate_up"),
+        py::arg("packed"), py::arg("sf_swz"),
+        py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
+
+    m.def("silu_mul_merged_to_nvfp4_swizzled_grouped32_bf16",
+        [](uintptr_t merged_gate_up,
+           uintptr_t packed, uintptr_t sf_swz,
+           int rows, int cols, uintptr_t stream) -> int {
+            return flash_rt::kernels::silu_mul_merged_to_nvfp4_swizzled_grouped32_bf16(
                 to_ptr(merged_gate_up),
                 to_ptr(packed), to_ptr(sf_swz),
                 rows, cols, to_stream(stream));
