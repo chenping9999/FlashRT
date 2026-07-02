@@ -23,11 +23,11 @@ NVFP4 surface is compiled in automatically (internally gated by
 flag users pass). Then install the runtime extras:
 
 ```bash
-pip install -e ".[minimax-remover]"   # diffusers + einops + sageattention
+pip install -e ".[minimax-remover]"   # diffusers + einops + scipy + sageattention
 ```
 
 Importing `flash_rt.models.minimax_remover` always succeeds — it needs
-**none** of `diffusers` / `einops` / `triton` / `sageattention`. The
+**none** of `diffusers` / `einops` / `scipy` / `triton` / `sageattention`. The
 kernel surface is validated lazily in
 `MiniMaxRemoverPipeline.__init__` via `_load_kernels()`, and the runtime
 deps are resolved at construction via `_import_runtime()`. If a required
