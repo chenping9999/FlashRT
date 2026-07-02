@@ -262,6 +262,72 @@ def test_fp8_pipeline_constructor_calls_load_kernels(monkeypatch):
     assert len(calls) == 1
 
 
+def test_fp8_pipeline_call_does_not_patch_pipe_class(monkeypatch):
+    """Wrapping one FP8 pipe must not alter all instances of that pipe class."""
+    from flash_rt.models.minimax_remover import _fp8_pipeline
+
+    class _Transformer:
+        def to(self, _dtype):
+            return self
+
+    class _CallablePipe:
+        def __init__(self, name):
+            self.name = name
+            self.transformer = _Transformer()
+            self.calls = []
+
+        def __call__(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return self.name, args, kwargs
+
+    set_calibration_calls = []
+    freeze_calls = []
+
+    def _fake_runtime():
+        def install_flashrt_fp8(_transformer, verbose=True, target="all"):
+            return 0
+
+        def set_calibration(_transformer, on):
+            set_calibration_calls.append(on)
+
+        def freeze_calibration(_transformer, margin=1.1):
+            freeze_calls.append(margin)
+            return 3
+
+        def install_fused_blocks(_transformer):
+            return 0
+
+        def install_fa2_attention(_transformer):
+            return 0
+
+        return (install_flashrt_fp8, set_calibration, freeze_calibration,
+                install_fused_blocks, install_fa2_attention)
+
+    monkeypatch.setattr(_fp8_pipeline, "load_fp8_kernels", lambda: object())
+    monkeypatch.setattr(_fp8_pipeline, "_import_runtime_fp8", _fake_runtime)
+
+    pipe1 = _CallablePipe("pipe1")
+    pipe2 = _CallablePipe("pipe2")
+    original_call = _CallablePipe.__call__
+
+    wrapped = _fp8_pipeline.MiniMaxRemoverPipelineFP8(pipe1)
+
+    assert _CallablePipe.__call__ is original_call
+    assert pipe2("unwrapped") == ("pipe2", ("unwrapped",), {})
+    assert not set_calibration_calls
+    assert not freeze_calls
+
+    assert wrapped("wrapped", flag=True) == (
+        "pipe1", ("wrapped",), {"flag": True})
+    assert set_calibration_calls == [True]
+    assert freeze_calls == [1.1]
+    assert wrapped._calibrated
+
+    assert wrapped("again") == ("pipe1", ("again",), {})
+    assert set_calibration_calls == [True]
+    assert freeze_calls == [1.1]
+
+
 # ── 4. Gated build: required symbols present and callable ──
 
 def _get_kernels_or_skip():

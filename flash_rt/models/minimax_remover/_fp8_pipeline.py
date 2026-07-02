@@ -94,38 +94,22 @@ class MiniMaxRemoverPipelineFP8:
         logger.info("MiniMax-Remover FP8: %d attention blocks -> kernel backend",
                     n_attn)
 
-        self._install_calibrated_call()
+        self._orig_pipe_call = self.pipe.__call__
 
-    def _install_calibrated_call(self):
-        """Wrap pipe.__call__ so the first invocation calibrates FP8 scales.
-
-        On the first call: enable calibration mode, run the full diffusers
-        __call__ (which runs num_inference_steps transformer forwards
-        accumulating amax on GPU), then freeze the static act_scale.
-        Subsequent calls use the frozen scales directly.
-        """
-        _orig_call = self.pipe.__class__.__call__
-
-        pipeline_fp8 = self
-
-        @torch.no_grad()
-        def _calibrated_call(pipe_self, *args, **kwargs):
-            if not pipeline_fp8._calibrated:
-                logger.info("MiniMax-Remover FP8: calibration mode "
-                            "(first call, dynamic FP8 + amax accumulation)")
-                pipeline_fp8._set_calibration(True)
-
-            result = _orig_call(pipe_self, *args, **kwargs)
-
-            if not pipeline_fp8._calibrated:
-                n = pipeline_fp8._freeze_calibration()
-                pipeline_fp8._calibrated = True
-                logger.info("MiniMax-Remover FP8: calibration done, "
-                            "froze %d static act_scales (margin=%.2f)",
-                            n, pipeline_fp8.calib_margin)
-            return result
-
-        self.pipe.__class__.__call__ = _calibrated_call
-
+    @torch.no_grad()
     def __call__(self, *args, **kwargs):
-        return self.pipe(*args, **kwargs)
+        """Run the wrapped pipe, calibrating FP8 scales on the first call."""
+        if not self._calibrated:
+            logger.info("MiniMax-Remover FP8: calibration mode "
+                        "(first call, dynamic FP8 + amax accumulation)")
+            self._set_calibration(True)
+
+        result = self._orig_pipe_call(*args, **kwargs)
+
+        if not self._calibrated:
+            n = self._freeze_calibration()
+            self._calibrated = True
+            logger.info("MiniMax-Remover FP8: calibration done, "
+                        "froze %d static act_scales (margin=%.2f)",
+                        n, self.calib_margin)
+        return result
