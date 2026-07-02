@@ -6,6 +6,11 @@ transformer denoise path onto NVFP4 (W4A4) GEMMs driven by the generic
 FlashRT kernels, fused fp32-stat Triton norm/RoPE, kernel attention and
 a graph-capturable manual N-step flow-matching loop.
 
+For full-frame inpainting prefer the FP8 (W8A8) sibling
+``MiniMaxRemoverPipelineFP8`` in ``_fp8_pipeline.py`` (near-fp16 precision,
+recommended default); this NVFP4 path is calibrated only for small cropped
+regions.
+
 What is replaced (vs the diffusers reference ``Minimax_Remover_Pipeline``):
 
 * every eligible transformer Linear -> NVFP4 W4A4 GEMM (weight quantised
@@ -24,48 +29,37 @@ imported -- the VAE encode / decode run unchanged from the loaded model.
 
 The pipeline requires the generic SM120 NVFP4 kernels in
 ``flash_rt_kernels``. They are gated by the Blackwell NVFP4 build option
-(``ENABLE_CUTLASS_SM120_NVFP4_W4A16``); ``_load_kernels`` validates them
-and raises a clear ``RuntimeError`` if they are absent, so a non-NVFP4
-build fails fast instead of crashing mid-quantisation.
+(``ENABLE_CUTLASS_SM120_NVFP4_W4A16``); ``load_nvfp4_kernels`` (defined in
+``_utils``, the single source of truth for the kernel surface) validates
+them and raises a clear ``RuntimeError`` if they are absent, so a
+non-NVFP4 build fails fast instead of crashing mid-quantisation.
 """
 
 import logging
 import os
-import types
 
 import torch
 
 logger = logging.getLogger(__name__)
 
-# Core generic SM120 NVFP4 kernel surface required by this pipeline. All of
-# these are compiled in automatically on a Blackwell (sm_120a / sm_121a)
-# build; if any is missing the pipeline cannot run and _load_kernels raises
-# a clear RuntimeError.
-_REQUIRED_NVFP4_SYMBOLS = (
-    "nvfp4_sf_swizzled_bytes",
-    "bf16_weight_to_nvfp4_swizzled",
-    "quantize_bf16_to_nvfp4_swizzled",
-    "fp4_w4a16_gemm_sm120_bf16out_pingpong",
-    "add_bias_bf16",
-    "fp4_w4a16_gemm_bias_gelu_fp4out_sm120",
+from flash_rt.models.minimax_remover._fp8_pipeline import MiniMaxRemoverPipelineFP8
+from flash_rt.models.minimax_remover._utils import (
+    _REQUIRED_NVFP4_SYMBOLS,
+    _load_kernels,
+    load_nvfp4_kernels,
 )
 
-# Optional third-party packages pulled in only when the pipeline is actually
-# constructed. Importing this model package never touches them, so
-# `import flash_rt.models.minimax_remover` succeeds in a bare environment.
+# Re-exported here for backward compatibility (docs / tests historically import
+# the kernel surface from this module). The single source of truth lives in
+# ``_utils``; the two must never diverge.
+__all__ = ["MiniMaxRemoverPipeline", "MiniMaxRemoverPipelineFP8",
+           "_REQUIRED_NVFP4_SYMBOLS", "_load_kernels"]
+
 _RUNTIME_DEPS = ("diffusers", "einops", "triton")
 
 
 def _import_runtime():
-    """Lazily import the optional runtime deps + the pipeline submodules.
-
-    Importing ``flash_rt.models.minimax_remover`` does not require any of
-    the optional dependencies; they are only resolved here, at pipeline
-    construction time. Raises ``RuntimeError`` with an install hint if any
-    optional dep is missing instead of a low-level ``ModuleNotFoundError``.
-
-    Returns ``(install_flashrt_nvfp4, install_attention, ManualRemoverPipeline)``.
-    """
+    """Lazily import the optional runtime deps + the pipeline submodules."""
     missing = []
     for dep in _RUNTIME_DEPS:
         try:
@@ -84,37 +78,6 @@ def _import_runtime():
     from ._attention import install_attention
     from ._manual_denoise import ManualRemoverPipeline
     return install_flashrt_nvfp4, install_attention, ManualRemoverPipeline
-
-
-def _load_kernels():
-    """Import ``flash_rt_kernels`` and validate the required NVFP4 surface.
-
-    Returns the raw ``flash_rt_kernels`` module. Raises ``RuntimeError``
-    if any required symbol is missing (i.e. the build was not configured
-    with the Blackwell NVFP4 kernels enabled).
-    """
-    try:
-        from flash_rt import flash_rt_kernels as fvk
-    except ImportError:
-        try:
-            import flash_rt_kernels as fvk  # type: ignore
-        except ImportError:
-            raise RuntimeError(
-                "flash_rt_kernels is not available. Build FlashRT with "
-                "'pip install -e .' and ensure the compiled .so is on the path.")
-
-    missing = [s for s in _REQUIRED_NVFP4_SYMBOLS if not hasattr(fvk, s)]
-    if missing:
-        raise RuntimeError(
-            "MiniMax-Remover requires the SM120 NVFP4 kernels which are not "
-            "compiled into flash_rt_kernels. Build FlashRT for Blackwell, which "
-            "auto-enables the NVFP4 kernels:\n"
-            "    cmake -S . -B build -DGPU_ARCH=120 -DCMAKE_BUILD_TYPE=Release\n"
-            "    cmake --build build -j --target flash_rt_kernels\n"
-            "(sm_120a / sm_121a, i.e. GPU_ARCH=120/121). The internal compile "
-            "flag is ENABLE_CUTLASS_SM120_NVFP4_W4A16.\n"
-            f"Missing symbols: {', '.join(missing)}")
-    return fvk
 
 
 class _FrozenMarker:
@@ -156,7 +119,7 @@ class MiniMaxRemoverPipeline:
 
     def __init__(self, pipe, num_inference_steps=12, fp4_target="all",
                  use_bf16=True, use_manual_pipeline=True):
-        self.fvk = _load_kernels()
+        self.fvk = load_nvfp4_kernels()
         # Optional runtime deps (diffusers / einops / triton) and the pipeline
         # submodules are resolved here, at construction time -- importing the
         # model package never touches them.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MiniMax-Remover full-frame mask removal -- FlashRT NVFP4 quickstart.
+"""MiniMax-Remover full-frame mask removal -- FlashRT FP8 quickstart.
 
 End-to-end demo of the FlashRT-accelerated MiniMax-Remover video mask
 removal pipeline. Every frame (plus its binary mask) is fed to the model
@@ -10,17 +10,21 @@ This is a FlashRT optimization of the upstream project:
     https://github.com/zibojia/MiniMax-Remover
 
 It wraps a loaded diffusers MiniMax-Remover pipeline with
-``flash_rt.models.minimax_remover.MiniMaxRemoverPipeline``, which rewrites
-the transformer denoise path onto NVFP4 (W4A4) GEMMs, fused fp32-stat
-Triton norm/RoPE, kernel attention and a graph-capturable manual
-flow-matching loop.
+``flash_rt.models.minimax_remover.MiniMaxRemoverPipelineFP8`` (default) or
+``MiniMaxRemoverPipeline`` (NVFP4, --use-fp4). The FP8 path rewrites the
+transformer denoise path onto FP8 (W8A8) GEMMs with static calibration,
+fused norm/RoPE/gelu kernels and kernel attention; the NVFP4 path adds a
+graph-captured manual flow-matching loop. FP8 stays close to the fp16
+reference on full-frame inputs (end-to-end cosine >= 0.999, PSNR ~35-41 dB);
+NVFP4 is only for small cropped regions.
 
 ------------------------------------------------------------------
 Test data
 ------------------------------------------------------------------
 Sample frames + masks (numeric filenames, aligned by frame number):
 
-    git clone https://github.com/chenping9999/object_removal_data.git
+    <path-to-sample-frames-and-masks>
+    (frames and masks directories with numeric filenames, aligned by frame number)
 
 ------------------------------------------------------------------
 Model weights
@@ -564,7 +568,7 @@ def pad_masks_bottom_right(masks: np.ndarray, ph: int, pw: int) -> np.ndarray:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="MiniMax-Remover full-frame mask removal (FlashRT NVFP4).")
+        description="MiniMax-Remover full-frame mask removal (FlashRT FP8).")
     p.add_argument("--model-dir", type=str, required=True,
                    help="MiniMax-Remover checkpoint dir (vae/ transformer/ scheduler/).")
     p.add_argument("--frames-dir", type=str, required=True,
@@ -578,6 +582,13 @@ def parse_args() -> argparse.Namespace:
                    help="Denoise steps (default 12).")
     p.add_argument("--no-flashrt", action="store_true",
                    help="Run the reference diffusers path instead of FlashRT (for diffing).")
+    p.add_argument("--use-fp4", action="store_true",
+                   help="Use NVFP4 (W4A4) instead of the default FP8 (W8A8). "
+                        "NVFP4 is only calibrated for small cropped regions "
+                        "(bbox crop); full-frame inpainting will produce "
+                        "black/drift outputs. FP8 (default) is recommended "
+                        "for full-frame inpainting (end-to-end cosine >= 0.999, "
+                        "PSNR ~35-41 dB vs fp16).")
     return p.parse_args()
 
 
@@ -599,7 +610,7 @@ def main() -> None:
             "--include vae transformer scheduler --local-dir <model-dir>")
 
     print("=" * 60)
-    print("MiniMax-Remover full-frame mask removal (FlashRT NVFP4 W4A4)")
+    print("MiniMax-Remover full-frame mask removal (FlashRT FP8 W8A8)")
     print("=" * 60)
 
     image_paths = collect_frame_files(frames_dir)
@@ -635,10 +646,14 @@ def main() -> None:
     if args.no_flashrt:
         runner = pipe
         tag = "reference (diffusers fp16)"
-    else:
+    elif args.use_fp4:
         from flash_rt.models.minimax_remover import MiniMaxRemoverPipeline
         runner = MiniMaxRemoverPipeline(pipe)
-        tag = "FlashRT NVFP4 W4A4"
+        tag = "FlashRT NVFP4 W4A4 (small-region only)"
+    else:
+        from flash_rt.models.minimax_remover import MiniMaxRemoverPipelineFP8
+        runner = MiniMaxRemoverPipelineFP8(pipe)
+        tag = "FlashRT FP8 W8A8 (full-frame)"
 
     t, h, w, _ = frames_padded.shape
     images_tensor = torch.from_numpy(frames_padded).to(device=DEVICE, dtype=torch.float16)
