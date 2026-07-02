@@ -12,9 +12,9 @@ with cosine similarity >= 0.999 against the fp16 reference output.
 
 Calibration workflow:
   1. install_flashrt_fp8(transformer)  -> replace all Linears with FlashRTFp8Linear
-  2. transformer.begin_calibration()   -> enter calibration mode (forward records activation amax)
+  2. set_calibration(transformer, True) -> enter calibration mode (forward records activation amax)
   3. Run several representative forwards (e.g. all 12 steps of the first inference segment)
-  4. transformer.end_calibration(margin=1.0) -> freeze the static act_scale
+  4. freeze_calibration(transformer, margin=1.0) -> freeze the static act_scale
 """
 
 import logging

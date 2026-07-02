@@ -15,11 +15,16 @@ The attention backend is selected by ``FLASHRT_ATTN_MODE``:
                                    (default; ~5x vs FA2, cos ~0.9993).
   * ``sage_fp16`` / ``sage1``   -- SageAttention QK-int8 + PV-fp16 CUDA.
   * ``sage_triton``             -- SageAttention QK-int8 + PV-fp16 Triton.
+  * ``triton_fp8`` / ``triton_fp16`` -- self-contained Triton flash-attention
+                                   (``_triton_flash_attn``); no external dep.
   * ``fa2``                     -- FlashRT FA2 (``flash_rt_fa2.fwd_fp16``).
 
 ``sageattention`` is an optional third-party dependency (pip); only the
 selected backend is imported lazily. ``fa2`` uses FlashRT's own vendored
-``flash_rt_fa2.so``. No MiniMax-Remover imports -- tensors only.
+``flash_rt_fa2.so``. This module is the single source of truth for
+attention dispatch -- shared by both the NVFP4 (``_manual_denoise``) and
+FP8 (``_kern_block``) block paths. No MiniMax-Remover imports -- tensors
+only.
 """
 
 import math
@@ -56,6 +61,18 @@ def _get_sage():
                 "    FLASHRT_ATTN_MODE=fa2") from e
         _SAGE = _m
     return _SAGE
+
+
+_TRITON_FA = None
+
+
+def _get_triton_fa():
+    """Lazy import the standalone Triton flash-attention (fp8 / fp16 variants)."""
+    global _TRITON_FA
+    if _TRITON_FA is None:
+        from . import _triton_flash_attn as _m
+        _TRITON_FA = _m
+    return _TRITON_FA
 
 
 def _sage_attn(q, k, v, scale, mode):
@@ -100,10 +117,18 @@ def _fa2_attn(q, k, v, scale, lse_cache=None):
 
 
 def attention_forward(q, k, v, scale, mode=None, *, lse_cache=None):
-    """Dispatch MiniMax-Remover attention without importing unused backends."""
+    """Dispatch MiniMax-Remover attention without importing unused backends.
+
+    Single source of truth for the ``FLASHRT_ATTN_MODE`` routing; shared by
+    both the NVFP4 (``_manual_denoise``) and FP8 (``_kern_block``) paths.
+    """
     mode = _attention_mode() if mode is None else str(mode).lower()
     if mode.startswith("sage"):
         return _sage_attn(q, k, v, scale, mode)
+    if mode in ("triton_fp8", "triton_fp16"):
+        tfa = _get_triton_fa()
+        return (tfa.flash_attn_fp8 if mode == "triton_fp8"
+                else tfa.flash_attn_fp16)(q, k, v, scale)
     return _fa2_attn(q, k, v, scale, lse_cache)
 
 
