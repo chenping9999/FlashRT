@@ -21,7 +21,8 @@
 #include <cuda_runtime.h>
 
 namespace flash_rt {
-namespace quantize {
+namespace kernels {
+namespace minimax_remover {
 namespace {
 
 constexpr int kThreadsX = 32;
@@ -154,5 +155,6 @@ int fp16_rms_norm_ncdhw(
   return static_cast<int>(cudaGetLastError());
 }
 
-}  // namespace quantize
+}  // namespace minimax_remover
+}  // namespace kernels
 }  // namespace flash_rt

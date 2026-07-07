@@ -3,7 +3,8 @@
 #include <cuda_runtime.h>
 
 namespace flash_rt {
-namespace quantize {
+namespace kernels {
+namespace minimax_remover {
 
 // Fused FP16 NCDHW RMSNorm for Wan VAE (MiniMax-Remover).
 // fp16 in/out, fp32 statistics — no dtype cast.
@@ -26,5 +27,6 @@ int fp16_rms_norm_ncdhw(
     float eps,
     cudaStream_t stream);
 
-}  // namespace quantize
+}  // namespace minimax_remover
+}  // namespace kernels
 }  // namespace flash_rt

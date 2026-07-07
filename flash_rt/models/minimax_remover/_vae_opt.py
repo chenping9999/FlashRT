@@ -1,21 +1,21 @@
-"""FlashRT -- MiniMax-Remover VAE optimization: fp16-native fused RMS_norm.
+"""FlashRT -- MiniMax-Remover VAE optimization: fp16-native fused kernels.
 
 Replaces diffusers WanRMS_norm.forward (4 full-tensor fp32 passes,
 ~0.45 ms each at [1,384,1,240,432]) with the FlashRT
 ``fp16_rms_norm_ncdhw`` CUDA kernel (single-pass, fp16 in/out, fp32
 internal statistics, ~0.07 ms -- a ~6x speed-up per call).
 
+Additionally fuses RMS_norm + SiLU in every WanResidualBlock via
+``fp16_rms_silu_ncdhw`` (one pass instead of norm->write->silu->write),
+and eliminates the redundant fp32 cast in WanUpsample (nearest-exact
+upsample is index-only, so fp16 == fp32 bit-for-bit).
+
 Key design decision: **no dtype cast**. The VAE stays in fp16 (cuDNN
-already dispatches fp16 tensorop conv kernels). Only the RMS_norm
-op is replaced. This preserves fp16's 10-bit mantissa end-to-end,
+already dispatches fp16 tensorop conv kernels). Only the norm/activation
+ops are replaced. This preserves fp16's 10-bit mantissa end-to-end,
 keeping PSNR at ~40 dB vs the fp16 reference (vs ~15 dB for the
 bf16-cast path which loses 3 bits of mantissa across 52 RMS_norm
 layers).
-
-The VAE decode loop is frame-by-frame (18 iters for a 70-frame clip),
-each iter touching ~29 RMS_norm sites, so ~522 RMS_norm calls account
-for ~3.5 s of the ~3.3 s decode wall time. This kernel cuts that to
-~0.4 s.
 """
 from __future__ import annotations
 
@@ -23,13 +23,54 @@ import logging
 from typing import Dict
 
 import torch
-
-from flash_rt import flash_rt_kernels as fvk
+import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
+# The fp16 fused kernels live in a standalone pybind module
+# (flash_rt_minimax_remover) that is opt-in:
+#   cmake -DFLASHRT_ENABLE_MINIMAX_REMOVER=ON -DGPU_ARCH=120 ...
+_fvk = None
+try:
+    from flash_rt import flash_rt_minimax_remover as _fvk
+except ImportError:
+    try:
+        import flash_rt_minimax_remover as _fvk
+    except ImportError:
+        pass
+
 _FP16 = torch.float16
 _EPS = 1e-6
+
+
+def _shape_ncdhw(x: torch.Tensor):
+    """Return (B, C, T, H, W) for 4D/5D NCDHW tensors, else None."""
+    if x.dim() == 4:
+        B, C, H, W = x.shape
+        return B, C, 1, H, W
+    if x.dim() == 5:
+        B, C, T, H, W = x.shape
+        return B, C, T, H, W
+    return None
+
+
+def _prep_gamma_bias(gamma, bias):
+    """Return contiguous fp16 (gamma_flat, bias_ptr) for the kernels."""
+    if gamma.dtype != _FP16:
+        gamma = gamma.to(_FP16)
+    gamma_flat = gamma.contiguous().view(-1)
+    if isinstance(bias, torch.Tensor):
+        bias_flat = bias.contiguous().view(-1).to(_FP16)
+        return gamma_flat, bias_flat.data_ptr()
+    return gamma_flat, 0
+
+
+def _ref_rms_norm(gamma, bias, x):
+    """Reference fallback (fp32 stats, fp16 out) -- WanRMS_norm semantics."""
+    C = x.shape[1]
+    scale = C ** 0.5
+    out = torch.nn.functional.normalize(x.float(), dim=1).to(x.dtype)
+    return out * scale * gamma + (bias if isinstance(bias, torch.Tensor) else 0.0)
 
 
 def _flashrt_fp16_rms_norm_forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -37,61 +78,87 @@ def _flashrt_fp16_rms_norm_forward(self, x: torch.Tensor) -> torch.Tensor:
 
     Computes: y = (x / rms(x)) * gamma + bias  (fp16 in/out, fp32 stats)
     which equals WanRMS_norm's F.normalize(x, dim=1) * sqrt(C) * gamma.
-
-    Handles 4D [B,C,H,W] (attention blocks) and 5D [B,C,T,H,W]
-    (encoder/decoder resnets) by viewing 4D as T=1.
     """
-    if x.dim() == 4:
-        B, C, H, W = x.shape
-        T = 1
-    elif x.dim() == 5:
-        B, C, T, H, W = x.shape
-    else:
+    shp = _shape_ncdhw(x)
+    if shp is None:
         return self._orig_forward(x)
+    B, C, T, H, W = shp
 
-    # Ensure fp16 (the VAE is fp16; this is a no-op in normal operation).
     if x.dtype != _FP16:
         x = x.to(_FP16)
-
-    # The kernel assumes contiguous NCDHW (channel stride = T*H*W).
-    # Some VAE layers (e.g. after upsampler time_conv permute) produce
-    # non-contiguous tensors -- fall back to the original path for those.
     if not x.is_contiguous():
         x = x.contiguous()
 
-    gamma = self.gamma
-    if gamma.dtype != _FP16:
-        gamma = gamma.to(_FP16)
-    # gamma is [C,1,1,1] or [C,1,1] -> kernel reads first C elements
-    gamma_flat = gamma.contiguous().view(-1)
-
-    bias = self.bias
-    if isinstance(bias, torch.Tensor):
-        bias_flat = bias.contiguous().view(-1).to(_FP16)
-        bias_ptr = bias_flat.data_ptr()
-    else:
-        bias_ptr = 0  # nullptr — kernel checks and skips bias
-
+    gamma_flat, bias_ptr = _prep_gamma_bias(self.gamma, self.bias)
     out = torch.empty_like(x)
     stream = torch.cuda.current_stream().cuda_stream
-    rc = fvk.fp16_rms_norm_ncdhw(
+    rc = _fvk.fp16_rms_norm_ncdhw(
         x.data_ptr(), gamma_flat.data_ptr(), bias_ptr,
         out.data_ptr(), B, C, T, H, W, _EPS, stream)
     if rc != 0:
-        # Fallback to original on kernel error (e.g. odd C)
-        return self._orig_forward(x)
+        return _ref_rms_norm(self.gamma, self.bias, x)
     return out
 
 
-def install_flashrt_fp16_rms_norm(vae) -> int:
-    """Replace every WanRMS_norm.forward with the FlashRT fp16 kernel.
+class _FusedRmsSilu(nn.Module):
+    """Drop-in for WanRMS_norm that outputs silu(rms_norm(x)) in one kernel.
 
-    Patches the class method (shared across encoder + decoder + mid_block).
-    No dtype cast is applied to the VAE — it stays fp16.
+    Installed as WanResidualBlock.norm1/norm2 while the block's
+    ``nonlinearity`` is swapped to ``Identity`` -- so the existing
+    ``forward`` (norm1 -> nonlinearity -> conv1 -> norm2 -> nonlinearity
+    -> conv2) silently becomes a fused norm+silu path with no rewrite of
+    the complex causal-cache logic.
+    """
+
+    def __init__(self, gamma, bias):
+        super().__init__()
+        self.gamma = gamma
+        self.bias = bias
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shp = _shape_ncdhw(x)
+        if shp is None:
+            return torch.nn.functional.silu(_ref_rms_norm(self.gamma, self.bias, x))
+        B, C, T, H, W = shp
+
+        if x.dtype != _FP16:
+            x = x.to(_FP16)
+        if not x.is_contiguous():
+            x = x.contiguous()
+
+        gamma_flat, bias_ptr = _prep_gamma_bias(self.gamma, self.bias)
+        out = torch.empty_like(x)
+        stream = torch.cuda.current_stream().cuda_stream
+        rc = _fvk.fp16_rms_silu_ncdhw(
+            x.data_ptr(), gamma_flat.data_ptr(), bias_ptr,
+            out.data_ptr(), B, C, T, H, W, _EPS, stream)
+        if rc != 0:
+            return torch.nn.functional.silu(_ref_rms_norm(self.gamma, self.bias, x))
+        return out
+
+
+def install_flashrt_fp16_rms_norm(vae) -> int:
+    """Replace WanRMS_norm.forward (attention sites) with the FlashRT fp16
+    kernel, and fuse norm+silu inside every WanResidualBlock.
+
+    Attention-block norms (WanAttentionBlock) keep the plain rms_norm
+    kernel (no SiLU follows them).  Residual-block norms (norm1/norm2)
+    are swapped to the fused ``fp16_rms_silu_ncdhw`` kernel and the
+    block's SiLU is set to Identity, so the existing ``forward`` runs the
+    fused path without touching the causal-cache logic.
 
     Returns the count of patched modules.
     """
-    from diffusers.models.autoencoders.autoencoder_kl_wan import WanRMS_norm
+    from diffusers.models.autoencoders.autoencoder_kl_wan import (
+        WanRMS_norm, WanResidualBlock)
+
+    n_fused = 0
+    for blk in vae.modules():
+        if isinstance(blk, WanResidualBlock):
+            blk.norm1 = _FusedRmsSilu(blk.norm1.gamma, blk.norm1.bias)
+            blk.norm2 = _FusedRmsSilu(blk.norm2.gamma, blk.norm2.bias)
+            blk.nonlinearity = nn.Identity()
+            n_fused += 1
 
     if not getattr(WanRMS_norm, "_flashrt_fp16_patched", False):
         WanRMS_norm._orig_forward = WanRMS_norm.forward
@@ -100,16 +167,46 @@ def install_flashrt_fp16_rms_norm(vae) -> int:
         logger.info("[minimax-vae] patched WanRMS_norm.forward -> FlashRT "
                     "fp16_rms_norm_ncdhw (fp16-native, no cast, ~6x faster)")
 
-    n = sum(1 for m in vae.modules() if isinstance(m, WanRMS_norm))
-    logger.info("[minimax-vae] %d WanRMS_norm modules now use FlashRT fp16 kernel", n)
-    return n
+    logger.info("[minimax-vae] %d WanResidualBlock(s) now use fused "
+                "fp16_rms_silu_ncdhw (norm+silu in one pass)", n_fused)
+    return n_fused
+
+
+def _install_wan_upsample_no_cast(vae) -> int:
+    """Eliminate the redundant fp32 cast in WanUpsample.
+
+    WanUpsample.forward does ``super().forward(x.float()).type_as(x)``.
+    For ``nearest-exact`` mode the upsample is pure index selection (no
+    arithmetic), so fp16 and fp32 give bit-identical results -- the cast
+    is wasted bandwidth.  This swaps it to a fp16-native forward.
+    """
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanUpsample
+
+    if not getattr(WanUpsample, "_flashrt_nocast", False):
+        _orig_upsample_forward = WanUpsample.forward
+
+        def _no_cast_forward(self, x):
+            if self.mode == "nearest-exact":
+                return nn.Upsample.forward(self, x)
+            return _orig_upsample_forward(self, x)
+
+        WanUpsample.forward = _no_cast_forward
+        WanUpsample._flashrt_nocast = True
+        logger.info("[minimax-vae] patched WanUpsample.forward -> "
+                    "fp16-native (nearest-exact cast eliminated)")
+
+    return sum(1 for m in vae.modules() if isinstance(m, WanUpsample))
 
 
 def install_vae_optimizations(vae, dtype=None) -> Dict:
-    """Apply VAE optimization: fp16-native fused RMS_norm kernel.
+    """Apply VAE optimizations: fp16-native fused RMS_norm + RMS_SiLU kernels
+    + WanUpsample cast elimination.
 
-    No dtype cast is applied — the VAE stays fp16. Only WanRMS_norm is
-    replaced with the FlashRT fp16 CUDA kernel.
+    No dtype cast is applied -- the VAE stays fp16. Only norm/activation
+    ops are replaced with FlashRT fp16 CUDA kernels.
+
+    Requires the standalone ``flash_rt_minimax_remover`` module, built with:
+        cmake -DFLASHRT_ENABLE_MINIMAX_REMOVER=ON -DGPU_ARCH=120 ...
 
     Args:
         vae: loaded ``diffusers.AutoencoderKLWan`` instance.
@@ -117,9 +214,21 @@ def install_vae_optimizations(vae, dtype=None) -> Dict:
 
     Returns:
         stats dict.
+
+    Raises:
+        ImportError if flash_rt_minimax_remover is not built.
     """
-    n_norm = install_flashrt_fp16_rms_norm(vae)
-    return {"n_rms_norm_patched": n_norm, "vae_dtype": str(next(vae.parameters()).dtype)}
+    if _fvk is None:
+        raise ImportError(
+            "flash_rt_minimax_remover not found; rebuild FlashRT with: "
+            "cmake -DFLASHRT_ENABLE_MINIMAX_REMOVER=ON -DGPU_ARCH=120 ...")
+    n_fused_blocks = install_flashrt_fp16_rms_norm(vae)
+    n_upsample = _install_wan_upsample_no_cast(vae)
+    return {
+        "n_fused_res_blocks": n_fused_blocks,
+        "n_upsample_nocast": n_upsample,
+        "vae_dtype": str(next(vae.parameters()).dtype),
+    }
 
 
 @torch.no_grad()

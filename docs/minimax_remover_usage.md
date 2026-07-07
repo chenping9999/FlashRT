@@ -9,25 +9,29 @@ kernelized inference on Blackwell SM120. Two precision paths ship under
 | `MiniMaxRemoverPipelineFP8` | FP8 (W8A8) | **Default.** Full-frame inpainting; end-to-end cosine >= 0.999, PSNR ~35-41 dB vs fp16 (see Performance). |
 | `MiniMaxRemoverPipeline` | NVFP4 (W4A4) | Cropped small regions only. Full-frame large latents drift/blacken due to FP4 error accumulation. |
 
-Both reuse the **generic** FlashRT kernels — the package ships **no
-model-specific CUDA operators** — and rewrite the transformer Linears as
-quantized GEMMs, fuse norm/gate/residual/gelu ops, and use kernel attention
-(FA2 / SageAttention). The NVFP4 path additionally captures the N-step
-flow-matching loop as a single CUDA Graph; the FP8 path is graph-compatible
-(stable static scales, no host sync in steady state) but does not itself
-capture a graph.
+Both reuse the **generic** FlashRT kernels for the transformer denoise path
+(quantized GEMMs, fused norm/gate/residual/gelu ops, kernel attention via
+FA2 / SageAttention). The VAE encode/decode is additionally accelerated by
+**model-specific fp16 fused CUDA kernels** in the standalone
+`flash_rt_minimax_remover` module (opt-in build, see [Build](#build)):
+`fp16_rms_norm_ncdhw` (single-pass RMSNorm, fp16-native) and
+`fp16_rms_silu_ncdhw` (fused RMSNorm + SiLU). The NVFP4 path additionally
+captures the N-step flow-matching loop as a single CUDA Graph; the FP8 path
+is graph-compatible (stable static scales, no host sync in steady state) but
+does not itself capture a graph.
 
 ## Build
 
 ```bash
 cd FlashRT
-cmake -S . -B build -DGPU_ARCH=120 -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j --target flash_rt_kernels
+cmake -S . -B build -DGPU_ARCH=120 -DCMAKE_BUILD_TYPE=Release \
+      -DFLASHRT_ENABLE_MINIMAX_REMOVER=ON
+cmake --build build -j --target flash_rt_kernels flash_rt_minimax_remover
 pip install -e ".[torch,minimax-remover]"
 ```
 
-`GPU_ARCH=120` (RTX 5090) or `121` selects the Blackwell target; the NVFP4
-surface is compiled in automatically (internally gated by
+`GPU_ARCH=120` (RTX 5090 / 5060 Ti) or `121` selects the Blackwell target;
+the NVFP4 surface is compiled in automatically (internally gated by
 `ENABLE_CUTLASS_SM120_NVFP4_W4A16`, which is set from `GPU_ARCH`, not a flag
 users pass). The FP8 symbols are part of the default build. Then install the
 runtime extras:
@@ -35,6 +39,30 @@ runtime extras:
 ```bash
 pip install -e ".[minimax-remover]"   # diffusers + einops + scipy + sageattention
 ```
+
+### VAE fused kernels (standalone module, opt-in)
+
+The fp16-native fused VAE kernels ship in a **separate** pybind module
+`flash_rt_minimax_remover`, following the same opt-in pattern as
+`flash_rt_omnivoice`. They are **not** compiled into the default
+`flash_rt_kernels` target — enable explicitly:
+
+```bash
+cmake -DFLASHRT_ENABLE_MINIMAX_REMOVER=ON -DGPU_ARCH=120 ...
+cmake --build build -j --target flash_rt_minimax_remover
+```
+
+| Kernel | Module | Replaces | Effect |
+|--------|--------|----------|--------|
+| `fp16_rms_norm_ncdhw` | `flash_rt_minimax_remover` | `WanRMS_norm.forward` (4 full-tensor fp32 passes) in attention blocks | ~6x per-call; fp16 in/out, fp32 stats, **no dtype cast** |
+| `fp16_rms_silu_ncdhw` | `flash_rt_minimax_remover` | `WanRMS_norm` + `F.silu` two-pass in every `WanResidualBlock` | fused single-pass; eliminates intermediate tensor R/W |
+| `WanUpsample` patch | Python (no kernel) | `x.float().type_as(x)` for nearest-exact upsample | eliminates redundant fp32 cast (index-only op, fp16 == fp32) |
+
+The VAE stays fp16 throughout (cuDNN dispatches fp16 tensorop conv kernels).
+Only norm/activation ops are replaced — preserving fp16's 10-bit mantissa
+end-to-end (PSNR ~41 dB vs fp16 reference). If the module is not built,
+`install_vae_optimizations()` raises a clear `ImportError` with the rebuild
+command.
 
 Importing `flash_rt.models.minimax_remover` always succeeds — it needs
 **none** of `diffusers` / `einops` / `scipy` / `triton` / `sageattention`. The kernel
@@ -120,10 +148,13 @@ MiniMax-Remover `pipe` and consumes it in place:
   inside the captured graph there are **zero** torch elementwise ops —
   every operation is a kernel launch.
 
-Both paths run the VAE encode / decode unchanged from the loaded diffusers
-model (one-shot per segment, outside the graph). No MiniMax-Remover source
-is imported; the `pipe` is duck-typed through `.transformer` / `.vae` /
-`.scheduler` / `.video_processor` and the `expand_masks` / `resize` helpers.
+Both paths run the VAE encode / decode from the loaded diffusers model
+(one-shot per segment, outside the graph). With `--vae-opt` (default), the
+VAE's `WanRMS_norm` / `WanResidualBlock` norm+silu sites are replaced by the
+FlashRT fp16 fused kernels (see [VAE fused kernels](#vae-fused-kernels-standalone-module-opt-in)).
+No MiniMax-Remover source is imported; the `pipe` is duck-typed through
+`.transformer` / `.vae` / `.scheduler` / `.video_processor` and the
+`expand_masks` / `resize` helpers.
 
 ## Performance (RTX 5060 Ti, SM120, CUDA 13)
 
@@ -134,9 +165,10 @@ python3 examples/minimax_remover_quickstart.py \
     --model-dir ./minimax-remover \
     --frames-dir ./object_removal_data/<frames> \
     --masks-dir  ./object_removal_data/<masks> \
-    --output-dir ./out                          # FP8 (default)
-python3 examples/minimax_remover_quickstart.py ... --use-fp4   # NVFP4
-python3 examples/minimax_remover_quickstart.py ... --no-flashrt  # fp16 reference
+    --output-dir ./out                          # FP8 + VAE opt (default)
+python3 examples/minimax_remover_quickstart.py ... --no-vae-opt   # FP8, no VAE kernels
+python3 examples/minimax_remover_quickstart.py ... --use-fp4      # NVFP4
+python3 examples/minimax_remover_quickstart.py ... --no-flashrt   # fp16 reference
 ```
 
 Wall time is a single end-to-end segment (load -> encode -> denoise loop ->
@@ -151,8 +183,9 @@ All rows compare against the non-FlashRT `--no-flashrt` fp16 reference on the
 
 | Clip (frames, resolution) | Stack | Wall time | Speedup vs fp16 ref | PSNR mean / worst vs fp16 ref | cosine mean |
 |--------------------------|-------|-----------|---------------------|-------------------------------|-------------|
-| tennis (70 frames, 432x240) | fp16 reference (`--no-flashrt`) | 17.31 s | 1.0x | — | — |
-| tennis (70 frames, 432x240) | FlashRT FP8 (default) | 11.76 s | **1.47x** | 40.8 / 37.4 dB | 0.99981 |
+| tennis (70 frames, 432x240) | fp16 reference (`--no-flashrt`) | 17.33 s | 1.0x | — | — |
+| tennis (70 frames, 432x240) | FlashRT FP8 (no VAE opt) | 11.78 s | 1.47x | 40.9 / 37.4 dB | 0.99981 |
+| tennis (70 frames, 432x240) | **FlashRT FP8 + VAE opt (default)** | **10.93 s** | **1.59x** | **40.9 / 37.3 dB** | 0.99981 |
 | tennis (70 frames, 432x240) | FlashRT NVFP4 (`--use-fp4`) | 9.52 s | 1.82x | 7.0 / 6.2 dB | 0.00000 (broken) |
 | bmx-trees (80 frames, 432x240) | fp16 reference (`--no-flashrt`) | 19.76 s | 1.0x | — | — |
 | bmx-trees (80 frames, 432x240) | FlashRT FP8 (default) | 13.24 s | **1.49x** | 35.1 / 32.0 dB | 0.99912 |
@@ -160,8 +193,12 @@ All rows compare against the non-FlashRT `--no-flashrt` fp16 reference on the
 
 Takeaways:
 
-- **FP8 is the correct default for full-frame inpainting**: ~1.5x faster than
-  the fp16 reference with cosine >= 0.999 and PSNR 35-41 dB.
+- **FP8 + VAE opt is the recommended default**: 1.59x faster than the fp16
+  reference with PSNR 40.9 dB on full-frame tennis clip. The fused VAE
+  kernels add ~7% speedup on top of FP8 alone (11.78 s -> 10.93 s) at no
+  precision cost.
+- **FP8 alone** (without VAE kernels) is already 1.47x faster with
+  cosine >= 0.999 and PSNR 35-41 dB.
 - **NVFP4 is faster but unusable on full-frame latents**: cosine collapses to
   ~0.0 and PSNR to ~7 dB (median per-pixel deviation ~85/255). The FP4
   quantisation error accumulates over the large full-frame activations and the
@@ -190,6 +227,9 @@ to the quantised GEMMs and the attention backend.
 
 | Component | Metric | Value |
 |-----------|--------|-------|
+| VAE `fp16_rms_norm_ncdhw` kernel | cosine vs fp32 reference | >= 0.9999999 |
+| VAE `fp16_rms_silu_ncdhw` kernel | cosine vs fp32 reference | >= 0.9999999 |
+| End-to-end FP8 + VAE opt (full-frame) | PSNR vs fp16 ref | 35-41 dB (mean) / >= 32 dB (worst frame) |
 | Attention — SageAttention QK-int8 PV-fp8 (`sage_fp8`, default) | cosine vs SDPA | 0.9993 |
 | Attention — SageAttention QK-int8 PV-fp16 (`sage_fp16`) | cosine vs SDPA | 0.9999 |
 | NVFP4 W4A4 GEMM | cosine vs fp16 matmul | >= 0.999 |
@@ -203,6 +243,14 @@ The default `sage_fp8` attention gives the best latency at cosine 0.9993;
 switch to `FLASHRT_ATTN_MODE=sage_fp16` for cosine 0.9999 at a small
 latency cost. NVFP4 needs no calibration, so the first call is already in
 the steady state; the FP8 path calibrates on the first call then freezes.
+
+## CLI flags (quickstart)
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--vae-opt` / `--no-vae-opt` | **enabled** | Install FlashRT fp16 fused VAE kernels (`fp16_rms_norm_ncdhw`, `fp16_rms_silu_ncdhw`) + `WanUpsample` cast elimination. Requires the `flash_rt_minimax_remover` module. |
+| `--use-fp4` | off | Use NVFP4 (W4A4) instead of the default FP8 (W8A8). Small-region only. |
+| `--no-flashrt` | off | Run the reference diffusers fp16 path (no FlashRT). |
 
 ## Environment variables
 

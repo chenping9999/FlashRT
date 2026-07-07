@@ -168,6 +168,11 @@ option(FLASHRT_ENABLE_MELBAND_ROFORMER
 # Enable explicitly on a Blackwell (sm_120) build.
 option(FLASHRT_ENABLE_OMNIVOICE
        "Build OmniVoice TTS RTX SM120 fused kernels in flash_rt_omnivoice" OFF)
+# MiniMax-Remover — builds flash_rt_minimax_remover.so with fp16-native
+# fused RMS_norm + RMS_SiLU CUDA kernels for the Wan VAE.  OFF by default;
+# enable with -DFLASHRT_ENABLE_MINIMAX_REMOVER=ON.
+option(FLASHRT_ENABLE_MINIMAX_REMOVER
+       "Build MiniMax-Remover VAE fused fp16 kernels in flash_rt_minimax_remover" OFF)
 # ── Slim build for VLA deployments ──
 # OFF by default: the standard build keeps the broad, compatibility-oriented
 # kernel set it has today. Turn ON (-DFLASHRT_SLIM_BUILD=ON) to drop
@@ -949,6 +954,39 @@ else()
   message(STATUS "OmniVoice TTS SM120 kernels: DISABLED")
 endif()
 
+# ── MiniMax-Remover VAE fused kernels (standalone module, independent
+#    of flash_rt_kernels) ──
+# Builds flash_rt_minimax_remover.so with fp16-native fused RMS_norm and
+# RMS_norm+SiLU CUDA kernels for the Wan VAE decoder/encoder.  The module
+# is opt-in and remains separate from the default flash_rt_kernels target.
+# Enable explicitly on a Blackwell (sm_120) build:
+#   cmake -DFLASHRT_ENABLE_MINIMAX_REMOVER=ON -DGPU_ARCH=120 ...
+if(FLASHRT_ENABLE_MINIMAX_REMOVER)
+  pybind11_add_module(flash_rt_minimax_remover
+    csrc/minimax_remover_extra_bindings.cpp
+    csrc/kernels/minimax_remover/fp16_rms_norm_ncdhw.cu
+    csrc/kernels/minimax_remover/fp16_rms_silu_ncdhw.cu)
+  set_target_properties(flash_rt_minimax_remover PROPERTIES
+    CUDA_STANDARD 17
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+  target_include_directories(flash_rt_minimax_remover PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels)
+  target_compile_options(flash_rt_minimax_remover PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      -U__CUDA_NO_HALF_OPERATORS__
+      -U__CUDA_NO_HALF2_OPERATORS__
+      ${GPU_GENCODE}
+    >)
+  target_link_libraries(flash_rt_minimax_remover PRIVATE CUDA::cudart)
+  install(TARGETS flash_rt_minimax_remover LIBRARY DESTINATION flash_rt)
+  message(STATUS "MiniMax-Remover VAE fused kernels: ENABLED")
+else()
+  message(STATUS "MiniMax-Remover VAE fused kernels: DISABLED")
+endif()
+
 if(FLASHRT_BUILD_QWEN3_VL)
   # SM120 (RTX 5090): NVFP4/FP8 ViT helpers. SM89 (Ada): native FP8 block-128
   # GEMM/GEMV + fused act/norm-quant + QK norm-rope kernels for the official
@@ -1147,8 +1185,7 @@ if(NOT FLASHRT_SLIM_BUILD)
     csrc/quantize/bf16_ndhwc_to_ncdhw_transpose.cu
     csrc/quantize/bf16_quant_fp8_ncdhw_to_ndhwc.cu
     csrc/quantize/bf16_rms_silu_ncdhw.cu
-    csrc/quantize/bf16_rms_silu_quant_fp8_ncdhw_to_ndhwc_v4.cu
-    csrc/quantize/fp16_rms_norm_ncdhw.cu)
+    csrc/quantize/bf16_rms_silu_quant_fp8_ncdhw_to_ndhwc_v4.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_MOTUS_VAE_FP8=1)
   message(STATUS "Motus VAE FP8 quantize kernels: ENABLED")
 else()

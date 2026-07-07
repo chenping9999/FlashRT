@@ -38,10 +38,12 @@ Download the VAE / transformer / scheduler once:
 Build
 ------------------------------------------------------------------
 FlashRT must be built for Blackwell so the generic SM120 NVFP4 kernels
-are compiled in (GPU_ARCH=120 / 121 auto-enables them):
+are compiled in (GPU_ARCH=120 / 121 auto-enables them). The VAE
+fused fp16 kernels are opt-in (FLASHRT_ENABLE_MINIMAX_REMOVER=ON):
 
-    cmake -S . -B build -DGPU_ARCH=120 -DCMAKE_BUILD_TYPE=Release
-    cmake --build build -j --target flash_rt_kernels
+    cmake -S . -B build -DGPU_ARCH=120 -DCMAKE_BUILD_TYPE=Release \
+          -DFLASHRT_ENABLE_MINIMAX_REMOVER=ON
+    cmake --build build -j --target flash_rt_kernels flash_rt_minimax_remover
     pip install -e ".[torch,minimax-remover]"
 
 ------------------------------------------------------------------
@@ -51,7 +53,8 @@ Run
         --model-dir ./minimax-remover \
         --frames-dir ./object_removal_data/<frames> \
         --masks-dir  ./object_removal_data/<masks> \
-        --output-dir ./out
+        --output-dir ./out                          # FP8 + VAE opt (default)
+    python3 examples/minimax_remover_quickstart.py ... --no-vae-opt  # FP8 only
 
 ------------------------------------------------------------------
 Precision note
@@ -589,11 +592,14 @@ def parse_args() -> argparse.Namespace:
                         "black/drift outputs. FP8 (default) is recommended "
                         "for full-frame inpainting (end-to-end cosine >= 0.999, "
                         "PSNR ~35-41 dB vs fp16).")
-    p.add_argument("--vae-opt", action="store_true",
-                   help="Apply FlashRT VAE optimisations: BF16 cast + fused "
-                        "RMS_norm kernel (bf16_rms_norm_ncdhw). The VAE is "
-                        "~65% of wall time on the FP8 path; this cuts it to "
-                        "~15%. Cosine >= 0.9999 vs the fp16 VAE reference.")
+    p.add_argument("--vae-opt", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Apply FlashRT VAE optimisations: fused fp16 RMS_norm "
+                        "+ RMS_SiLU CUDA kernels and WanUpsample cast "
+                        "elimination. The VAE is ~60%% of wall time on the "
+                        "FP8 path; this cuts it significantly. PSNR >= 40 dB "
+                        "vs the fp16 VAE reference. (default: enabled; use "
+                        "--no-vae-opt to disable)")
     return p.parse_args()
 
 
