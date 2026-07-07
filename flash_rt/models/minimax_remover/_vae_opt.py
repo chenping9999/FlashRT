@@ -199,12 +199,15 @@ def _install_wan_upsample_no_cast(vae) -> int:
     return sum(1 for m in vae.modules() if isinstance(m, WanUpsample))
 
 
-def install_vae_optimizations(vae, dtype=None) -> Dict:
+def install_vae_optimizations(vae, dtype=None, use_fp8_conv: bool = True) -> Dict:
     """Apply VAE optimizations: fp16-native fused RMS_norm + RMS_SiLU kernels
-    + WanUpsample cast elimination.
+    + WanUpsample cast elimination + channels-last 3D pipeline + FP8
+    implicit-GEMM conv3d.
 
     No dtype cast is applied -- the VAE stays fp16. Only norm/activation
-    ops are replaced with FlashRT fp16 CUDA kernels.
+    ops are replaced with FlashRT fp16 CUDA kernels, and applicable 3x3x3
+    conv3d layers are replaced with FP8 implicit-GEMM kernels (fp16 in/out,
+    FP8 e4m3 internal compute).
 
     Requires the standalone ``flash_rt_minimax_remover`` module, built with:
         cmake -DFLASHRT_ENABLE_MINIMAX_REMOVER=ON -DGPU_ARCH=120 ...
@@ -212,6 +215,8 @@ def install_vae_optimizations(vae, dtype=None) -> Dict:
     Args:
         vae: loaded ``diffusers.AutoencoderKLWan`` instance.
         dtype: ignored (kept for API compat with the old bf16 interface).
+        use_fp8_conv: if True, replace applicable 3x3x3 conv3d with the
+            FP8 implicit-GEMM kernel (default True).
 
     Returns:
         stats dict.
@@ -226,9 +231,11 @@ def install_vae_optimizations(vae, dtype=None) -> Dict:
     n_fused_blocks = install_flashrt_fp16_rms_norm(vae)
     n_upsample = _install_wan_upsample_no_cast(vae)
     _install_channels_last_pipeline(vae)
+    n_fp8_conv = _install_fp8_conv3d_pipeline(vae, enabled=use_fp8_conv)
     return {
         "n_fused_res_blocks": n_fused_blocks,
         "n_upsample_nocast": n_upsample,
+        "n_fp8_conv3d": n_fp8_conv,
         "vae_dtype": str(next(vae.parameters()).dtype),
     }
 
@@ -345,6 +352,183 @@ def _install_channels_last_pipeline(vae) -> int:
                 "NDHWC variant (eliminates ~287ms format conversion)",
                 n)
     return n
+
+
+# ================================================================
+# FP8 implicit-GEMM conv3d pipeline
+# ================================================================
+
+_FP8_E4M3_MAX = 448.0
+
+
+def _prequantize_conv3d_weight(conv):
+    """Pre-quantize a WanCausalConv3d 3x3x3 weight to FP8 e4m3.
+
+    Returns (w_fp8 [Co,3,3,3,Ci] fp8, w_scale [Co] float32) or
+    (None, None) if the conv is not applicable.
+    """
+    kt, kh, kw = conv.kernel_size
+    Ci, Co = conv.in_channels, conv.out_channels
+    if ((kt, kh, kw) != (3, 3, 3) or Ci % 32 != 0 or Co < 8 or
+            conv.groups != 1):
+        return None, None
+
+    w = conv.weight.data
+    if not w.is_contiguous(memory_format=torch.channels_last_3d):
+        w = w.to(memory_format=torch.channels_last_3d)
+    w_perm = w.permute(0, 2, 3, 4, 1).contiguous().float()
+
+    w_scale = w_perm.reshape(Co, -1).abs().amax(dim=1) / _FP8_E4M3_MAX
+    w_scale = w_scale.clamp(min=1e-6)
+
+    w_scaled = w_perm / w_scale.reshape(-1, 1, 1, 1, 1)
+    w_fp8 = w_scaled.clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(
+        torch.float8_e4m3fn)
+    return w_fp8.contiguous(), w_scale
+
+
+def _fp8_conv3d_forward(self, x, cache_x=None):
+    """FP8 implicit-GEMM conv3d forward for 3x3x3 causal convs.
+
+    Quantizes fp16 activations to FP8 e4m3 with a shared per-tensor
+    scale (computed over cache+new), runs the fused implicit-GEMM
+    MMA kernel with per-output-channel dequant, and returns fp16
+    output in channels-last 3D format.
+    """
+    B, Ci, T_new, H, W = x.shape
+    Co = self._fp8_w.shape[0]
+    stream = torch.cuda.current_stream().cuda_stream
+
+    if not x.is_contiguous(memory_format=torch.channels_last_3d):
+        x = x.to(memory_format=torch.channels_last_3d)
+
+    if cache_x is not None and cache_x.shape[2] >= 2:
+        cache_2 = cache_x[:, :, -2:]
+        if not cache_2.is_contiguous(memory_format=torch.channels_last_3d):
+            cache_2 = cache_2.to(memory_format=torch.channels_last_3d)
+    elif cache_x is not None and cache_x.shape[2] >= 1:
+        cache_2 = torch.empty(
+            B, Ci, 2, H, W, dtype=x.dtype, device=x.device,
+            memory_format=torch.channels_last_3d).zero_()
+        cache_2[:, :, 1:2] = cache_x[:, :, -1:]
+    else:
+        cache_2 = torch.empty(
+            B, Ci, 2, H, W, dtype=x.dtype, device=x.device,
+            memory_format=torch.channels_last_3d).zero_()
+
+    n_cache = cache_2.numel()
+    n_new = x.numel()
+
+    self._fp8_amax.zero_()
+    _fvk.amax_fp16(cache_2.data_ptr(), self._fp8_amax.data_ptr(),
+                   n_cache, stream)
+    _fvk.amax_fp16(x.data_ptr(), self._fp8_amax.data_ptr(),
+                   n_new, stream)
+
+    cache_fp8 = torch.empty(
+        n_cache, dtype=torch.float8_e4m3fn, device=x.device)
+    new_fp8 = torch.empty(
+        n_new, dtype=torch.float8_e4m3fn, device=x.device)
+    _fvk.quantize_fp16_fp8_with_amax(
+        cache_2.data_ptr(), cache_fp8.data_ptr(),
+        self._fp8_amax.data_ptr(), self._fp8_scale.data_ptr(),
+        n_cache, stream)
+    _fvk.quantize_fp16_fp8_with_amax(
+        x.data_ptr(), new_fp8.data_ptr(),
+        self._fp8_amax.data_ptr(), self._fp8_scale.data_ptr(),
+        n_new, stream)
+
+    alpha_vec = self._fp8_scale * self._w_scale
+
+    out = torch.empty(
+        B, Co, T_new, H, W, dtype=torch.float16, device=x.device,
+        memory_format=torch.channels_last_3d)
+
+    rc = _fvk.fp8_conv3d_mm_ndhwc_fp16out(
+        cache_fp8.data_ptr(), new_fp8.data_ptr(),
+        self._fp8_w.data_ptr(), out.data_ptr(),
+        self.bias.data_ptr() if self.bias is not None else 0,
+        alpha_vec.data_ptr(),
+        B, 2, T_new, H, W, Ci, Co, stream)
+
+    if rc != 0:
+        logger.warning("[fp8_conv3d_mm] kernel rc=%d, falling back to "
+                       "cuDNN for [%d,%d,%d,%d,%d]", rc, B, Ci, T_new, H, W)
+        padding = list(self._padding)
+        if cache_x is not None and self._padding[4] > 0:
+            cx = cache_x.to(x.device)
+            if not cx.is_contiguous(memory_format=torch.channels_last_3d):
+                cx = cx.to(memory_format=torch.channels_last_3d)
+            x_cat = torch.cat([cx, x], dim=2)
+            padding[4] -= cx.shape[2]
+        else:
+            x_cat = x
+        x_pad = F.pad(x_cat, padding)
+        return F.conv3d(x_pad, self.weight, self.bias, self.stride,
+                        self.padding, self.dilation, self.groups)
+    return out
+
+
+def _install_fp8_conv3d_pipeline(vae, enabled: bool = True) -> int:
+    """Pre-quantize applicable Conv3d weights to FP8 e4m3 and patch
+    WanCausalConv3d.forward to dispatch to the FP8 implicit-GEMM kernel.
+
+    For each 3x3x3 WanCausalConv3d with Ci % 32 == 0 and Co >= 8:
+      - Pre-quantize weight to FP8 e4m3 with per-output-channel scale.
+      - Store fp8 weight, scale, and scratch buffers as non-persistent
+        buffers on the module.
+
+    Non-applicable layers (1x1x1, 3x1x1, Ci%32!=0, Co<8) fall back to
+    the channels-last cuDNN path.
+    """
+    from diffusers.models.autoencoders.autoencoder_kl_wan import (
+        WanCausalConv3d)
+
+    if not enabled:
+        return 0
+
+    n_fp8 = 0
+    n_skip = 0
+    for m in vae.modules():
+        if isinstance(m, WanCausalConv3d):
+            w_fp8, w_scale = _prequantize_conv3d_weight(m)
+            if w_fp8 is not None:
+                device = m.weight.device
+                m.register_buffer('_fp8_w', w_fp8.to(device),
+                                  persistent=False)
+                m.register_buffer('_w_scale', w_scale.to(device),
+                                  persistent=False)
+                m.register_buffer('_fp8_amax',
+                                  torch.empty(1, dtype=torch.float32,
+                                              device=device),
+                                  persistent=False)
+                m.register_buffer('_fp8_scale',
+                                  torch.empty(1, dtype=torch.float32,
+                                              device=device),
+                                  persistent=False)
+                n_fp8 += 1
+            else:
+                m._fp8_w = None
+                n_skip += 1
+
+    if n_fp8 == 0:
+        logger.info("[minimax-vae] FP8 conv3d: 0 layers applicable")
+        return 0
+
+    _saved_forward = WanCausalConv3d.forward
+
+    def _fp8_dispatch_forward(self, x, cache_x=None):
+        if getattr(self, '_fp8_w', None) is not None:
+            return _fp8_conv3d_forward(self, x, cache_x)
+        return _saved_forward(self, x, cache_x)
+
+    WanCausalConv3d.forward = _fp8_dispatch_forward
+    WanCausalConv3d._flashrt_fp8_patched = True
+
+    logger.info("[minimax-vae] FP8 implicit-GEMM conv3d: %d layers "
+                "quantized, %d skipped (non-3x3x3 or Ci%%32!=0)",
+                n_fp8, n_skip)
+    return n_fp8
 
 
 @torch.no_grad()

@@ -597,9 +597,14 @@ def parse_args() -> argparse.Namespace:
                    help="Apply FlashRT VAE optimisations: fused fp16 RMS_norm "
                         "+ RMS_SiLU CUDA kernels and WanUpsample cast "
                         "elimination. The VAE is ~60%% of wall time on the "
-                        "FP8 path; this cuts it significantly. PSNR >= 40 dB "
+                        "FP8 path; this cuts it significantly. PSNR >= 39 dB "
                         "vs the fp16 VAE reference. (default: enabled; use "
                         "--no-vae-opt to disable)")
+    p.add_argument("--fp8-conv", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Use FP8 implicit-GEMM conv3d kernel for applicable "
+                        "3x3x3 causal convs (requires --vae-opt). Trades ~1.5 "
+                        "dB PSNR for ~13%% decode speedup. (default: enabled)")
     return p.parse_args()
 
 
@@ -656,7 +661,8 @@ def main() -> None:
 
     if args.vae_opt:
         from flash_rt.models.minimax_remover._vae_opt import install_vae_optimizations
-        stats = install_vae_optimizations(pipe.vae)
+        stats = install_vae_optimizations(pipe.vae,
+                                           use_fp8_conv=args.fp8_conv)
         print(f"  VAE optimised: {stats}")
 
     if args.no_flashrt:

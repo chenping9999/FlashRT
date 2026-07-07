@@ -16,6 +16,8 @@
 #include "kernels/minimax_remover/fp16_rms_norm_ncdhw.cuh"
 #include "kernels/minimax_remover/fp16_rms_silu_ncdhw.cuh"
 #include "kernels/minimax_remover/fp16_rms_norm_ndhwc.cuh"
+#include "kernels/minimax_remover/fp8_conv3d_mm_ndhwc_fp16out.cuh"
+#include "kernels/minimax_remover/fp16_quant_fp8_per_tensor.cuh"
 
 namespace py = pybind11;
 
@@ -90,4 +92,75 @@ PYBIND11_MODULE(flash_rt_minimax_remover, m) {
         py::arg("B"), py::arg("C"), py::arg("T"), py::arg("H"), py::arg("W"),
         py::arg("eps") = 1e-6f, py::arg("stream") = 0,
         "Fused FP16 channels-last (NDHWC) RMSNorm + SiLU.");
+
+    // ── FP8 implicit-GEMM conv3d (3×3×3 causal, NDHWC, fp16 output) ──
+    m.def("fp8_conv3d_mm_ndhwc_fp16out",
+        [](uintptr_t cache_x_fp8, uintptr_t new_x_fp8,
+           uintptr_t w_fp8, uintptr_t y_fp16,
+           uintptr_t bias_fp16, uintptr_t alpha_vec,
+           int N, int T_cache, int T_new, int H, int W, int Ci, int Co,
+           uintptr_t stream) {
+            return flash_rt::kernels::minimax_remover::
+                fp8_conv3d_mm_ndhwc_fp16out(
+                to_ptr(cache_x_fp8), to_ptr(new_x_fp8),
+                to_ptr(w_fp8), to_ptr(y_fp16),
+                bias_fp16 ? to_ptr(bias_fp16) : nullptr,
+                alpha_vec ? to_ptr(alpha_vec) : nullptr,
+                N, T_cache, T_new, H, W, Ci, Co,
+                to_stream(stream));
+        },
+        py::arg("cache_x_fp8"), py::arg("new_x_fp8"),
+        py::arg("w_fp8"), py::arg("y_fp16"),
+        py::arg("bias_fp16"), py::arg("alpha_vec"),
+        py::arg("N"), py::arg("T_cache"), py::arg("T_new"),
+        py::arg("H"), py::arg("W"), py::arg("Ci"), py::arg("Co"),
+        py::arg("stream") = 0,
+        "FP8 e4m3 implicit-GEMM conv3d fprop (3x3x3 causal, NDHWC, "
+        "fp16 output). Per-channel alpha vector [Co] float and fp16 "
+        "bias [Co]. No im2col materialization.");
+
+    // ── Fused fp16→fp8 per-tensor quantize (2-pass, no host sync) ──
+    m.def("fp16_quant_fp8_per_tensor",
+        [](uintptr_t x_fp16, uintptr_t y_fp8,
+           uintptr_t scale_out, uintptr_t amax_buf,
+           int n, uintptr_t stream) {
+            return flash_rt::kernels::minimax_remover::
+                fp16_quant_fp8_per_tensor(
+                to_ptr(x_fp16), to_ptr(y_fp8),
+                to_ptr(scale_out), to_ptr(amax_buf),
+                n, to_stream(stream));
+        },
+        py::arg("x_fp16"), py::arg("y_fp8"),
+        py::arg("scale_out"), py::arg("amax_buf"),
+        py::arg("n"), py::arg("stream") = 0,
+        "Fused per-tensor fp16→fp8 e4m3 quantize (amax + scale on "
+        "device, no host sync). Writes float scale to scale_out.");
+
+    m.def("amax_fp16",
+        [](uintptr_t x_fp16, uintptr_t amax_buf,
+           int n, uintptr_t stream) {
+            return flash_rt::kernels::minimax_remover::amax_fp16(
+                to_ptr(x_fp16), to_ptr(amax_buf), n, to_stream(stream));
+        },
+        py::arg("x_fp16"), py::arg("amax_buf"),
+        py::arg("n"), py::arg("stream") = 0,
+        "Grid-stride amax reduction into amax_buf via atomicMax. "
+        "Caller must zero amax_buf before first call. Multiple calls "
+        "accumulate (for multi-tensor shared-scale quantization).");
+
+    m.def("quantize_fp16_fp8_with_amax",
+        [](uintptr_t x_fp16, uintptr_t y_fp8,
+           uintptr_t amax_buf, uintptr_t scale_out,
+           int n, uintptr_t stream) {
+            return flash_rt::kernels::minimax_remover::
+                quantize_fp16_fp8_with_amax(
+                to_ptr(x_fp16), to_ptr(y_fp8),
+                to_ptr(amax_buf), to_ptr(scale_out),
+                n, to_stream(stream));
+        },
+        py::arg("x_fp16"), py::arg("y_fp8"),
+        py::arg("amax_buf"), py::arg("scale_out"),
+        py::arg("n"), py::arg("stream") = 0,
+        "Quantize fp16→fp8 using pre-computed amax in amax_buf. "
+        "Writes float scale to scale_out.");
 }
