@@ -19,6 +19,7 @@
 #include "kernels/minimax_remover/fp8_conv3d_mm_ndhwc_fp16out.cuh"
 #include "kernels/minimax_remover/fp16_quant_fp8_per_tensor.cuh"
 #include "kernels/minimax_remover/fp16_rms_silu_fp8_ndhwc.cuh"
+#include "kernels/minimax_remover/fp16_bias_gelu_quant_fp8.cuh"
 
 namespace py = pybind11;
 
@@ -248,4 +249,37 @@ PYBIND11_MODULE(flash_rt_minimax_remover, m) {
         "2-pass fused norm+silu+amax+quant → FP8. Pass 1 computes amax "
         "(no write); pass 2 re-reads x and quantizes. Produces ONLY fp8 "
         "output + scale, no fp16 intermediate.");
+
+    // ── Fused FFN epilogue: bias + gelu + quant → fp8 (transformer) ──
+    m.def("bias_gelu_quant_fp16_fp8",
+        [](uintptr_t gemm_out, uintptr_t bias, uintptr_t out,
+           uintptr_t d_scale, int M, int N, uintptr_t stream) {
+            return flash_rt::kernels::minimax_remover::
+                bias_gelu_quant_fp16_fp8(
+                to_ptr(gemm_out), to_ptr(bias), to_ptr(out),
+                reinterpret_cast<const float*>(to_ptr(d_scale)),
+                M, N, to_stream(stream));
+        },
+        py::arg("gemm_out"), py::arg("bias"), py::arg("out"),
+        py::arg("d_scale"), py::arg("M"), py::arg("N"),
+        py::arg("stream") = 0,
+        "Fused FFN epilogue: fp16 GEMM-out + bias → tanh-gelu → fp8 e4m3. "
+        "Replaces add_bias_fp16 + gelu_inplace_fp16 + quantize_fp8 (3 "
+        "kernels → 1). Output is the pre-quantised input of the next FP8 "
+        "Linear, which skips its own activation quantise.");
+
+    m.def("bias_quant_fp16_fp8",
+        [](uintptr_t gemm_out, uintptr_t bias, uintptr_t out,
+           uintptr_t d_scale, int M, int N, uintptr_t stream) {
+            return flash_rt::kernels::minimax_remover::
+                bias_quant_fp16_fp8(
+                to_ptr(gemm_out), to_ptr(bias), to_ptr(out),
+                reinterpret_cast<const float*>(to_ptr(d_scale)),
+                M, N, to_stream(stream));
+        },
+        py::arg("gemm_out"), py::arg("bias"), py::arg("out"),
+        py::arg("d_scale"), py::arg("M"), py::arg("N"),
+        py::arg("stream") = 0,
+        "Fused: fp16 GEMM-out + bias → fp8 e4m3 (identity activation). "
+        "For Linear→Linear chains with no activation in between.");
 }

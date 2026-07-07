@@ -67,6 +67,8 @@ cmake --build build -j --target flash_rt_minimax_remover
 | `fp8_conv3d_mm_ndhwc_fp16out` | `flash_rt_minimax_remover` | cuDNN fp16 conv3d for applicable 3×3×3 causal convs | FP8 e4m3 implicit-GEMM (no im2col materialization); per-channel weight dequant; fp16 in/out |
 | `amax_fp16` + `quantize_fp16_fp8_with_amax` | `flash_rt_minimax_remover` | PyTorch multi-pass `abs().max()` + scale + cast for activation quantization | fused 2-pass device-side amax + quantize; no host sync; shared scale across cache+new frames |
 | `quantize_fp16_fp8_with_amax_dual` | `flash_rt_minimax_remover` | two separate `quantize_fp16_fp8_with_amax` calls (cache + new) | single kernel launch quantizes two buffers with shared amax; saves 1 launch per conv layer |
+| `bias_gelu_quant_fp16_fp8` | `flash_rt_minimax_remover` | transformer FFN `add_bias_fp16` + `gelu_inplace_fp16` + `quantize_fp8_static_fp16` (3 kernels) | fused single-pass: fp16 GEMM-out + bias → tanh-gelu → fp8 e4m3; output is the pre-quantised input of the next FP8 Linear (skips its activation quantise); eliminates 3 full-tensor fp16 round-trips per FFN block |
+| `bias_quant_fp16_fp8` | `flash_rt_minimax_remover` | `add_bias_fp16` + `quantize_fp8_static_fp16` (identity activation variant) | fused bias + quant for Linear→Linear chains with no activation |
 | channels-last pipeline | Python (`_vae_opt.py`) | Conv3d weight → CL, WanCausalConv3d → CL-preserving forward | eliminates ~97% of nchw↔nhwc conversion kernels (~280 ms / decode) |
 | Running-max amax | Python (`_vae_opt.py`) | separate `amax_fp16` calls over cache + new each iteration | norm fuses amax via atomicMax into a persistent buffer shared with the sister conv; cache amax is skipped entirely (covered by running max) |
 | `WanUpsample` patch | Python (no kernel) | `x.float().type_as(x)` for nearest-exact upsample | eliminates redundant fp32 cast (index-only op, fp16 == fp32) |
@@ -152,6 +154,34 @@ conv3d path (8.75 s → 8.58 s) and **0.7 dB PSNR improvement**
 running-max scaling. Combined with the channels-last pipeline:
 **2.02× vs baseline**. PSNR 39.9 dB (median).
 
+#### Fused transformer FFN epilogue
+
+The transformer denoise loop spends ~877 ms / 12-step run on three
+elementwise "glue" kernels sandwiched between the FP8 GEMMs of each
+FeedForward block:
+
+  `add_bias_fp16` (607 ms) + `gelu_inplace_fp16` (233 ms) + `quantize_fp8` (270 ms)
+
+Each is a full read+write of the `[S, inner_dim]` fp16 FFN-up output
+(inner_dim = 13824). The `bias_gelu_quant_fp16_fp8` kernel collapses
+all three into a **single pass** that reads the GEMM's raw fp16 output
+once, applies bias + tanh-GELU in fp32, and writes fp8 e4m3 directly.
+The fp8 tensor becomes the pre-quantised input of the FFN-down Linear,
+which skips its own activation quantise step.
+
+All arithmetic (bias + GELU) is done in fp32 before the fp8 cast, so
+the result is actually **more accurate** than the original path (which
+rounds to fp16 twice along the way) — end-to-end PSNR improves from
+39.9 → 40.0 dB.
+
+The FP8 pipeline freezes calibration after the **first denoise step**
+(via a one-shot transformer forward hook), so steps 2..N run with
+static scales and the fused epilogue active — a single-call invocation
+benefits without needing a separate warm-up pass.
+
+Result: **denoise GPU time 3.73 s → 3.16 s** (-15%), end-to-end
+**8.58 s → 7.56 s** (**2.29× vs baseline**), PSNR **40.0 dB** (median).
+
 Importing `flash_rt.models.minimax_remover` always succeeds — it needs
 **none** of `diffusers` / `einops` / `scipy` / `triton` / `sageattention`. The kernel
 surface is validated lazily in each pipeline's `__init__` via
@@ -201,11 +231,12 @@ kernels are self-contained Triton JIT kernels shipped in the package
 
 `flash_rt/models/minimax_remover/_fp8_pipeline.py`. Uses static calibration:
 the first inference call runs in dynamic-FP8 calibration mode (accumulating
-activation amax on GPU), then freezes to a static `act_scale` for all
-subsequent calls (zero CPU sync overhead in the steady state, suitable for
-CUDA Graph capture). **The frozen scale is calibrated to the first call's
-input; if the input resolution/shape changes, construct a new pipeline so
-the scale is re-calibrated.**
+activation amax on GPU). A one-shot transformer forward hook **freezes the
+calibration after the first denoise step**, so steps 2..N (and the fused FFN
+epilogue kernel) run with static scales — a single-call invocation benefits
+without needing a separate warm-up pass. **The frozen scale is calibrated to
+the first call's input; if the input resolution/shape changes, construct a
+new pipeline so the scale is re-calibrated.**
 
 - every eligible transformer Linear -> FP8 W8A8 GEMM (weight quantised once
   at load time; activation quantised with a calibrated static scale);
@@ -277,7 +308,8 @@ All rows compare against the non-FlashRT `--no-flashrt` fp16 reference on the
 |--------------------------|-------|-----------|---------------------|-------------------------------|-------------|
 | tennis (70 frames, 432x240) | fp16 reference (`--no-flashrt`) | 17.33 s | 1.0x | — | — |
 | tennis (70 frames, 432x240) | FlashRT FP8 + VAE opt + CL (`--no-fp8-conv`) | 10.01 s | 1.73x | 40.8 / 37.0 dB | 0.99981 |
-| tennis (70 frames, 432x240) | **FlashRT FP8 + VAE opt + CL + FP8 conv3d (default)** | **8.58 s** | **2.02x** | **39.9 / 36.4 dB** | 0.99981 |
+| tennis (70 frames, 432x240) | FlashRT FP8 + VAE opt + CL + FP8 conv3d | 8.58 s | 2.02x | 39.9 / 36.4 dB | 0.99981 |
+| tennis (70 frames, 432x240) | **FlashRT FP8 + VAE opt + CL + FP8 conv3d + fused FFN epilogue (default)** | **7.56 s** | **2.29x** | **40.0 / 36.4 dB** | 0.99981 |
 | tennis (70 frames, 432x240) | FlashRT NVFP4 (`--use-fp4`) | 9.52 s | 1.82x | 7.0 / 6.2 dB | 0.00000 (broken) |
 | bmx-trees (80 frames, 432x240) | fp16 reference (`--no-flashrt`) | 19.76 s | 1.0x | — | — |
 | bmx-trees (80 frames, 432x240) | FlashRT FP8 (default) | 13.24 s | **1.49x** | 35.1 / 32.0 dB | 0.99912 |
@@ -289,14 +321,12 @@ All rows compare against the non-FlashRT `--no-flashrt` fp16 reference on the
 
 Takeaways:
 
-- **FP8 + VAE opt + CL + FP8 conv3d is the recommended default**: 2.02x
-  faster than the fp16 reference with PSNR 39.9 dB (median) on full-frame
-  tennis clip, peak VRAM reduced from 3.67 GB to 2.59 GB. The FP8
-  implicit-GEMM conv3d contributes an additional 14.3% speedup on top of
-  the channels-last pipeline (10.01 s → 8.58 s). The fused norm+silu+amax
-  + running-max + dual-quantize optimizations further improve both speed
-  (8.75 → 8.58 s) and precision (39.3 → 39.9 dB) over the original
-  FP8 conv3d path.
+- **FP8 + VAE opt + CL + FP8 conv3d + fused FFN epilogue is the recommended default**: 2.29x
+  faster than the fp16 reference with PSNR 40.0 dB (median) on full-frame
+  tennis clip, peak VRAM 2.51 GB. The fused FFN epilogue kernel
+  (`bias_gelu_quant_fp16_fp8`) collapses bias-add + GELU + activation
+  quantise into one pass, cutting denoise GPU time by 15% (3.73 → 3.16 s)
+  and end-to-end from 8.58 → 7.56 s.
 - **FP8 conv3d vs channels-last-only cuDNN**: the hand-rolled implicit-GEMM
   kernel (no im2col materialization, virtual cache concat, per-channel
   weight dequant, fused amax, running-max scale) beats cuDNN's fp16 conv3d
@@ -336,6 +366,7 @@ to the quantised GEMMs and the attention backend.
 | VAE `fp16_rms_silu_ndhwc` (CL) kernel | cosine vs fp32 reference | >= 0.9999999 |
 | VAE `fp16_rms_silu_amax_ndhwc` kernel | amax vs fp32 reference | exact (atomicMax on non-negative floats) |
 | VAE `fp8_conv3d_mm` kernel | cosine vs fp16 F.conv3d | >= 0.9993 (per-layer) |
+| End-to-end FP8 + VAE opt + CL + FP8 conv3d + fused FFN epilogue (full-frame) | PSNR vs fp16 ref | 40.0 dB (median) / >= 36.4 dB (worst frame) |
 | End-to-end FP8 + VAE opt + CL + FP8 conv3d (full-frame) | PSNR vs fp16 ref | 39.9 dB (median) / >= 36.4 dB (worst frame) |
 | End-to-end FP8 + VAE opt + CL only (no FP8 conv3d) | PSNR vs fp16 ref | 40.8 dB (median) / >= 37.0 dB (worst frame) |
 | Attention — SageAttention QK-int8 PV-fp8 (`sage_fp8`, default) | cosine vs SDPA | 0.9993 |

@@ -98,18 +98,40 @@ class MiniMaxRemoverPipelineFP8:
 
     @torch.no_grad()
     def __call__(self, *args, **kwargs):
-        """Run the wrapped pipe, calibrating FP8 scales on the first call."""
+        """Run the wrapped pipe, calibrating FP8 scales on the first call.
+
+        On the first call, a one-shot forward hook on the transformer
+        freezes the FP8 act_scales immediately after the FIRST denoise
+        step completes.  This lets steps 2..N (and the fused FFN epilogue
+        kernel) run with static scales, so a single-call invocation
+        benefits from the fused path instead of only multi-call ones.
+        The cost is a single CPU sync (~1 ms) after step 1.
+        """
         if not self._calibrated:
             logger.info("MiniMax-Remover FP8: calibration mode "
-                        "(first call, dynamic FP8 + amax accumulation)")
+                        "(first call, dynamic FP8 + amax accumulation; "
+                        "freezes after step 1)")
             self._set_calibration(True)
+            # One-shot hook: freeze after the first transformer forward.
+            fired = [False]
 
-        result = self._orig_pipe_call(*args, **kwargs)
+            def _freeze_after_step1(_module, _inp, _out):
+                if fired[0]:
+                    return
+                fired[0] = True
+                n = self._freeze_calibration()
+                self._calibrated = True
+                logger.info("MiniMax-Remover FP8: mid-inference freeze "
+                            "after step 1 — %d act_scales frozen "
+                            "(margin=%.2f); steps 2+ now use static FP8 "
+                            "+ fused FFN epilogue", n, self.calib_margin)
 
-        if not self._calibrated:
-            n = self._freeze_calibration()
-            self._calibrated = True
-            logger.info("MiniMax-Remover FP8: calibration done, "
-                        "froze %d static act_scales (margin=%.2f)",
-                        n, self.calib_margin)
+            handle = self.transformer.register_forward_hook(
+                _freeze_after_step1)
+            try:
+                result = self._orig_pipe_call(*args, **kwargs)
+            finally:
+                handle.remove()
+        else:
+            result = self._orig_pipe_call(*args, **kwargs)
         return result
