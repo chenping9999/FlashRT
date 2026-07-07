@@ -40,6 +40,15 @@ int quantize_fp16_fp8_with_amax(
     const void* amax_buf, void* scale_out,
     int n, cudaStream_t stream);
 
+// Dual quantize: quantizes TWO fp16 buffers with the SAME shared
+// amax in a single kernel launch.  Saves one launch vs calling
+// quantize_fp16_fp8_with_amax twice.  Writes one shared scale.
+int quantize_fp16_fp8_with_amax_dual(
+    const void* x1_fp16, void* y1_fp8, int n1,
+    const void* x2_fp16, void* y2_fp8, int n2,
+    const void* amax_buf, void* scale_out,
+    cudaStream_t stream);
+
 }  // namespace minimax_remover
 }  // namespace kernels
 }  // namespace flash_rt

@@ -309,10 +309,30 @@ def _install_channels_last_pipeline(vae) -> int:
         return out
 
     class _FusedRmsSiluCL(nn.Module):
+        """Fused RMSNorm+SiLU with optional amax computation for FP8 conv.
+
+        When _fp8_sister_conv is set (by the FP8 conv pipeline), the
+        forward computes the output amax via the fused
+        fp16_rms_silu_amax_ndhwc kernel and accumulates it into a
+        shared running-amax buffer via atomicMax.
+
+        The running-max buffer is shared with the sister conv so the
+        conv can skip its own amax pass over both x AND cache_x (the
+        cache was a previous output of this same norm, so its amax
+        was already accumulated in a prior iteration).
+        """
         def __init__(self, gamma, bias):
             super().__init__()
             self.gamma = gamma
             self.bias = bias
+            self._fp8_sister_conv = None
+            self._amax_buf = None
+            self._running_mode = False
+
+        def _ensure_amax_buf(self, device):
+            if self._amax_buf is None or self._amax_buf.device != device:
+                self._amax_buf = torch.zeros(
+                    1, dtype=torch.float32, device=device)
 
         def forward(self, x):
             if x.dim() == 4:
@@ -328,9 +348,20 @@ def _install_channels_last_pipeline(vae) -> int:
             gamma_flat, bias_ptr = _prep_gamma_bias(self.gamma, self.bias)
             out = torch.empty_like(x)
             stream = torch.cuda.current_stream().cuda_stream
-            rc = _fvk.fp16_rms_silu_ndhwc(
-                x.data_ptr(), gamma_flat.data_ptr(), bias_ptr,
-                out.data_ptr(), B, C, T, H, W, _EPS, stream)
+
+            if self._fp8_sister_conv is not None:
+                self._ensure_amax_buf(x.device)
+                if not self._running_mode:
+                    self._amax_buf.zero_()
+                rc = _fvk.fp16_rms_silu_amax_ndhwc(
+                    x.data_ptr(), gamma_flat.data_ptr(), bias_ptr,
+                    out.data_ptr(), self._amax_buf.data_ptr(),
+                    B, C, T, H, W, _EPS, stream)
+            else:
+                rc = _fvk.fp16_rms_silu_ndhwc(
+                    x.data_ptr(), gamma_flat.data_ptr(), bias_ptr,
+                    out.data_ptr(), B, C, T, H, W, _EPS, stream)
+
             if rc != 0:
                 return F.silu(_ref_rms_norm(self.gamma, self.bias, x))
             return out
@@ -390,10 +421,14 @@ def _prequantize_conv3d_weight(conv):
 def _fp8_conv3d_forward(self, x, cache_x=None):
     """FP8 implicit-GEMM conv3d forward for 3x3x3 causal convs.
 
-    Quantizes fp16 activations to FP8 e4m3 with a shared per-tensor
-    scale (computed over cache+new), runs the fused implicit-GEMM
-    MMA kernel with per-output-channel dequant, and returns fp16
-    output in channels-last 3D format.
+    Uses a running-max amax strategy: the sister-norm module
+    accumulates the output amax of x via atomicMax into a shared
+    buffer across iterations.  Since cache_x was a previous output
+    of the SAME norm module, its amax is already covered by the
+    running max — so we skip the cache amax pass entirely.
+
+    This saves one full read of the cache tensor per layer (~40 MB
+    for the largest layers).
     """
     B, Ci, T_new, H, W = x.shape
     Co = self._fp8_w.shape[0]
@@ -402,6 +437,7 @@ def _fp8_conv3d_forward(self, x, cache_x=None):
     if not x.is_contiguous(memory_format=torch.channels_last_3d):
         x = x.to(memory_format=torch.channels_last_3d)
 
+    # ── Resolve cache ────────────────────────────────────────────
     if cache_x is not None and cache_x.shape[2] >= 2:
         cache_2 = cache_x[:, :, -2:]
         if not cache_2.is_contiguous(memory_format=torch.channels_last_3d):
@@ -419,24 +455,50 @@ def _fp8_conv3d_forward(self, x, cache_x=None):
     n_cache = cache_2.numel()
     n_new = x.numel()
 
-    self._fp8_amax.zero_()
-    _fvk.amax_fp16(cache_2.data_ptr(), self._fp8_amax.data_ptr(),
-                   n_cache, stream)
-    _fvk.amax_fp16(x.data_ptr(), self._fp8_amax.data_ptr(),
-                   n_new, stream)
+    # ── Determine amax ───────────────────────────────────────────
+    sister_norm = getattr(self, '_sister_norm', None)
+    sister_amax = getattr(sister_norm, '_amax_buf', None) if sister_norm else None
+    running_mode = getattr(sister_norm, '_running_mode', False) if sister_norm else False
 
+    if sister_amax is not None and sister_amax.is_cuda and running_mode:
+        # Running-max path: amax of x already accumulated by norm.
+        # cache_x amax was accumulated in a previous iteration (same norm).
+        # No cache amax call needed!
+        shared_amax = sister_amax
+    elif sister_amax is not None and sister_amax.is_cuda:
+        # First-iteration path: norm computed x's amax, accumulate cache amax.
+        shared_amax = sister_amax
+        _fvk.amax_fp16(cache_2.data_ptr(), shared_amax.data_ptr(),
+                       n_cache, stream)
+    else:
+        # Fallback: compute amax from scratch.
+        shared_amax = self._fp8_amax
+        shared_amax.zero_()
+        _fvk.amax_fp16(cache_2.data_ptr(), shared_amax.data_ptr(),
+                       n_cache, stream)
+        _fvk.amax_fp16(x.data_ptr(), shared_amax.data_ptr(),
+                       n_new, stream)
+
+    # ── Quantize cache + new with shared amax (single launch) ──
     cache_fp8 = torch.empty(
         n_cache, dtype=torch.float8_e4m3fn, device=x.device)
     new_fp8 = torch.empty(
         n_new, dtype=torch.float8_e4m3fn, device=x.device)
-    _fvk.quantize_fp16_fp8_with_amax(
-        cache_2.data_ptr(), cache_fp8.data_ptr(),
-        self._fp8_amax.data_ptr(), self._fp8_scale.data_ptr(),
-        n_cache, stream)
-    _fvk.quantize_fp16_fp8_with_amax(
-        x.data_ptr(), new_fp8.data_ptr(),
-        self._fp8_amax.data_ptr(), self._fp8_scale.data_ptr(),
-        n_new, stream)
+    if hasattr(_fvk, 'quantize_fp16_fp8_with_amax_dual'):
+        _fvk.quantize_fp16_fp8_with_amax_dual(
+            cache_2.data_ptr(), cache_fp8.data_ptr(), n_cache,
+            x.data_ptr(), new_fp8.data_ptr(), n_new,
+            shared_amax.data_ptr(), self._fp8_scale.data_ptr(),
+            stream)
+    else:
+        _fvk.quantize_fp16_fp8_with_amax(
+            cache_2.data_ptr(), cache_fp8.data_ptr(),
+            shared_amax.data_ptr(), self._fp8_scale.data_ptr(),
+            n_cache, stream)
+        _fvk.quantize_fp16_fp8_with_amax(
+            x.data_ptr(), new_fp8.data_ptr(),
+            shared_amax.data_ptr(), self._fp8_scale.data_ptr(),
+            n_new, stream)
 
     alpha_vec = self._fp8_scale * self._w_scale
 
@@ -525,10 +587,44 @@ def _install_fp8_conv3d_pipeline(vae, enabled: bool = True) -> int:
     WanCausalConv3d.forward = _fp8_dispatch_forward
     WanCausalConv3d._flashrt_fp8_patched = True
 
+    # ── Wire up sister-norm references for fused amax ───────────
+    # Each FP8-enabled conv gets a reference to its sister norm module
+    # so it can reuse the amax computed by fp16_rms_silu_amax_ndhwc.
+    # The norm accumulates amax into a running-max buffer (shared with
+    # the conv) so the conv can skip amax over both x and cache_x.
+    try:
+        from diffusers.models.autoencoders.autoencoder_kl_wan import (
+            WanResidualBlock)
+        n_sister = 0
+        for blk in vae.modules():
+            if isinstance(blk, WanResidualBlock):
+                if getattr(blk.conv1, '_fp8_w', None) is not None:
+                    norm1 = blk.norm1
+                    if hasattr(norm1, '_fp8_sister_conv'):
+                        norm1._fp8_sister_conv = blk.conv1
+                        blk.conv1._sister_norm = norm1
+                        norm1._running_mode = True
+                        n_sister += 1
+                if getattr(blk.conv2, '_fp8_w', None) is not None:
+                    norm2 = blk.norm2
+                    if hasattr(norm2, '_fp8_sister_conv'):
+                        norm2._fp8_sister_conv = blk.conv2
+                        blk.conv2._sister_norm = norm2
+                        norm2._running_mode = True
+                        n_sister += 1
+        if n_sister > 0:
+            logger.info("[minimax-vae] fused norm+silu+amax + running-max: "
+                        "%d norm→conv links (skips amax over cache_x entirely)",
+                        n_sister)
+    except Exception as e:
+        logger.debug("[minimax-vae] sister-norm link skipped: %s", e)
+
     logger.info("[minimax-vae] FP8 implicit-GEMM conv3d: %d layers "
                 "quantized, %d skipped (non-3x3x3 or Ci%%32!=0)",
                 n_fp8, n_skip)
     return n_fp8
+
+
 
 
 @torch.no_grad()

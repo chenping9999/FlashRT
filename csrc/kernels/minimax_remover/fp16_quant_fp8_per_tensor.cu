@@ -141,6 +141,63 @@ int quantize_fp16_fp8_with_amax(
   return (e == cudaSuccess) ? 0 : -2;
 }
 
+// ── Dual quantize: two buffers, one shared amax, one launch ──
+__global__ void quantize_fp16_to_fp8_dual_kernel(
+    const __half* __restrict__ x1,
+    __nv_fp8_e4m3* __restrict__ y1, int n1,
+    const __half* __restrict__ x2,
+    __nv_fp8_e4m3* __restrict__ y2, int n2,
+    const float* amax_in, float* scale_out)
+{
+  __shared__ float s_inv_scale;
+  if (threadIdx.x == 0) {
+    float amax = fmaxf(*amax_in, 0.0f);
+    float scale = amax * (1.0f / 448.0f);
+    if (scale < 1e-6f) scale = 1e-6f;
+    if (scale_out != nullptr) *scale_out = scale;
+    s_inv_scale = 1.0f / scale;
+  }
+  __syncthreads();
+  float inv_scale = s_inv_scale;
+
+  // Grid-stride over both buffers using a unified index space
+  int total = n1 + n2;
+  int idx = blockIdx.x * Q_THREADS + threadIdx.x;
+  int stride = Q_THREADS * gridDim.x;
+  for (int i = idx; i < total; i += stride) {
+    if (i < n1) {
+      float val = __half2float(x1[i]) * inv_scale;
+      val = fminf(fmaxf(val, -448.0f), 448.0f);
+      y1[i] = __nv_fp8_e4m3(val);
+    } else {
+      int j = i - n1;
+      float val = __half2float(x2[j]) * inv_scale;
+      val = fminf(fmaxf(val, -448.0f), 448.0f);
+      y2[j] = __nv_fp8_e4m3(val);
+    }
+  }
+}
+
+int quantize_fp16_fp8_with_amax_dual(
+    const void* x1_fp16, void* y1_fp8, int n1,
+    const void* x2_fp16, void* y2_fp8, int n2,
+    const void* amax_buf, void* scale_out,
+    cudaStream_t stream)
+{
+  if (n1 <= 0 && n2 <= 0) return -1;
+  int total = n1 + n2;
+  int blocks = (total + Q_THREADS - 1) / Q_THREADS;
+  quantize_fp16_to_fp8_dual_kernel<<<blocks, Q_THREADS, 0, stream>>>(
+      reinterpret_cast<const __half*>(x1_fp16),
+      reinterpret_cast<__nv_fp8_e4m3*>(y1_fp8), n1,
+      reinterpret_cast<const __half*>(x2_fp16),
+      reinterpret_cast<__nv_fp8_e4m3*>(y2_fp8), n2,
+      reinterpret_cast<const float*>(amax_buf),
+      reinterpret_cast<float*>(scale_out));
+  cudaError_t e = cudaGetLastError();
+  return (e == cudaSuccess) ? 0 : -2;
+}
+
 }  // namespace minimax_remover
 }  // namespace kernels
 }  // namespace flash_rt

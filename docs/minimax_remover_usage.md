@@ -61,9 +61,14 @@ cmake --build build -j --target flash_rt_minimax_remover
 | `fp16_rms_silu_ncdhw` | `flash_rt_minimax_remover` | `WanRMS_norm` + `F.silu` two-pass in every `WanResidualBlock` | fused single-pass; eliminates intermediate tensor R/W |
 | `fp16_rms_norm_ndhwc` | `flash_rt_minimax_remover` | channels-last (NDHWC) variant of the above for attention-block norm | keeps pipeline in CL → eliminates nchw↔nhwc conversion |
 | `fp16_rms_silu_ndhwc` | `flash_rt_minimax_remover` | channels-last fused norm+silu for residual blocks | CL-native, contiguous C reads → faster than NCDHW variant |
+| `fp16_rms_silu_amax_ndhwc` | `flash_rt_minimax_remover` | channels-last fused norm+silu+**amax** | fuses amax into the norm+silu pass; saves 1 full read of the activation tensor per conv layer |
+| `fp16_rms_silu_quant_fp8_ndhwc` | `flash_rt_minimax_remover` | channels-last fused norm+silu→**FP8 e4m3** quantize | eliminates the fp16 intermediate between norm and conv (reads pre-computed amax) |
+| `fp16_rms_silu_amax_quant_fp8_ndhwc` | `flash_rt_minimax_remover` | 2-pass norm+silu+amax+quant→FP8 | combined launcher: pass 1 computes amax (no write), pass 2 quantizes; produces ONLY fp8 + scale |
 | `fp8_conv3d_mm_ndhwc_fp16out` | `flash_rt_minimax_remover` | cuDNN fp16 conv3d for applicable 3×3×3 causal convs | FP8 e4m3 implicit-GEMM (no im2col materialization); per-channel weight dequant; fp16 in/out |
 | `amax_fp16` + `quantize_fp16_fp8_with_amax` | `flash_rt_minimax_remover` | PyTorch multi-pass `abs().max()` + scale + cast for activation quantization | fused 2-pass device-side amax + quantize; no host sync; shared scale across cache+new frames |
+| `quantize_fp16_fp8_with_amax_dual` | `flash_rt_minimax_remover` | two separate `quantize_fp16_fp8_with_amax` calls (cache + new) | single kernel launch quantizes two buffers with shared amax; saves 1 launch per conv layer |
 | channels-last pipeline | Python (`_vae_opt.py`) | Conv3d weight → CL, WanCausalConv3d → CL-preserving forward | eliminates ~97% of nchw↔nhwc conversion kernels (~280 ms / decode) |
+| Running-max amax | Python (`_vae_opt.py`) | separate `amax_fp16` calls over cache + new each iteration | norm fuses amax via atomicMax into a persistent buffer shared with the sister conv; cache amax is skipped entirely (covered by running max) |
 | `WanUpsample` patch | Python (no kernel) | `x.float().type_as(x)` for nearest-exact upsample | eliminates redundant fp32 cast (index-only op, fp16 == fp32) |
 
 The VAE stays fp16 at the interface. Norm/activation ops use fp16-native
@@ -127,15 +132,25 @@ Key design:
 - **Fused activation quantization.** `amax_fp16` + atomicMax computes
   a shared per-tensor scale over cache+new (2-pass, no host sync), then
   `quantize_fp16_fp8_with_amax` scales and casts to FP8 e4m3.
+- **Running-max amax.** The norm module fuses amax into its
+  norm+silu pass via `fp16_rms_silu_amax_ndhwc` and accumulates it
+  into a persistent device-side buffer (atomicMax). Because cache_x
+  was a previous output of the same norm, its amax is already
+  covered — so the conv **skips the cache amax pass entirely**
+  (saves one full read of the 2-frame cache tensor per layer).
+- **Dual-quantize launch.** `quantize_fp16_fp8_with_amax_dual`
+  quantizes the cache and new tensors in a single kernel launch,
+  reducing launch overhead by ~49 calls per decode.
 - **Tile geometry.** BLOCK_M=128, BLOCK_N=128, BLOCK_K=32, 8 warps,
   2-stage cp.async pipeline, persistent Y-major CTA raster. The MMA
   instruction is
   `mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e4m3.e4m3.f32`.
 
-Result: **12.6% decode speedup** over channels-last-only cuDNN
-(10.01 s → 8.75 s), **1.98× vs baseline**. PSNR 39.3 dB (median) —
-a ~1.5 dB trade for the FP8 quantization, well within the "excellent"
-threshold. Enable/disable via `--fp8-conv` / `--no-fp8-conv`.
+Result: **1.7% additional decode speedup** over the previous FP8
+conv3d path (8.75 s → 8.58 s) and **0.7 dB PSNR improvement**
+(39.3 → 39.9 dB median) thanks to the temporally consistent
+running-max scaling. Combined with the channels-last pipeline:
+**2.02× vs baseline**. PSNR 39.9 dB (median).
 
 Importing `flash_rt.models.minimax_remover` always succeeds — it needs
 **none** of `diffusers` / `einops` / `scipy` / `triton` / `sageattention`. The kernel
@@ -262,7 +277,7 @@ All rows compare against the non-FlashRT `--no-flashrt` fp16 reference on the
 |--------------------------|-------|-----------|---------------------|-------------------------------|-------------|
 | tennis (70 frames, 432x240) | fp16 reference (`--no-flashrt`) | 17.33 s | 1.0x | — | — |
 | tennis (70 frames, 432x240) | FlashRT FP8 + VAE opt + CL (`--no-fp8-conv`) | 10.01 s | 1.73x | 40.8 / 37.0 dB | 0.99981 |
-| tennis (70 frames, 432x240) | **FlashRT FP8 + VAE opt + CL + FP8 conv3d (default)** | **8.75 s** | **1.98x** | **39.3 / 36.5 dB** | 0.99981 |
+| tennis (70 frames, 432x240) | **FlashRT FP8 + VAE opt + CL + FP8 conv3d (default)** | **8.58 s** | **2.02x** | **39.9 / 36.4 dB** | 0.99981 |
 | tennis (70 frames, 432x240) | FlashRT NVFP4 (`--use-fp4`) | 9.52 s | 1.82x | 7.0 / 6.2 dB | 0.00000 (broken) |
 | bmx-trees (80 frames, 432x240) | fp16 reference (`--no-flashrt`) | 19.76 s | 1.0x | — | — |
 | bmx-trees (80 frames, 432x240) | FlashRT FP8 (default) | 13.24 s | **1.49x** | 35.1 / 32.0 dB | 0.99912 |
@@ -274,16 +289,19 @@ All rows compare against the non-FlashRT `--no-flashrt` fp16 reference on the
 
 Takeaways:
 
-- **FP8 + VAE opt + CL + FP8 conv3d is the recommended default**: 1.98x
-  faster than the fp16 reference with PSNR 39.3 dB (median) on full-frame
-  tennis clip, peak VRAM reduced from 3.67 GB to 2.51 GB. The FP8
-  implicit-GEMM conv3d contributes an additional 12.6% speedup on top of
-  the channels-last pipeline (10.01 s → 8.75 s) at a ~1.5 dB PSNR cost.
+- **FP8 + VAE opt + CL + FP8 conv3d is the recommended default**: 2.02x
+  faster than the fp16 reference with PSNR 39.9 dB (median) on full-frame
+  tennis clip, peak VRAM reduced from 3.67 GB to 2.59 GB. The FP8
+  implicit-GEMM conv3d contributes an additional 14.3% speedup on top of
+  the channels-last pipeline (10.01 s → 8.58 s). The fused norm+silu+amax
+  + running-max + dual-quantize optimizations further improve both speed
+  (8.75 → 8.58 s) and precision (39.3 → 39.9 dB) over the original
+  FP8 conv3d path.
 - **FP8 conv3d vs channels-last-only cuDNN**: the hand-rolled implicit-GEMM
   kernel (no im2col materialization, virtual cache concat, per-channel
-  weight dequant) beats cuDNN's fp16 conv3d while staying in fp16 at the
-  interface. Disable with `--no-fp8-conv` to recover the 1.5 dB PSNR if
-  absolute precision is preferred over speed.
+  weight dequant, fused amax, running-max scale) beats cuDNN's fp16 conv3d
+  while staying in fp16 at the interface. Disable with `--no-fp8-conv` to
+  recover ~1 dB PSNR if absolute precision is preferred over speed.
 - **NVFP4 is faster but unusable on full-frame latents**: cosine collapses to
   ~0.0 and PSNR to ~7 dB (median per-pixel deviation ~85/255). The FP4
   quantisation error accumulates over the large full-frame activations and the
@@ -316,8 +334,9 @@ to the quantised GEMMs and the attention backend.
 | VAE `fp16_rms_silu_ncdhw` kernel | cosine vs fp32 reference | >= 0.9999999 |
 | VAE `fp16_rms_norm_ndhwc` (CL) kernel | cosine vs fp32 reference | >= 0.9999999 |
 | VAE `fp16_rms_silu_ndhwc` (CL) kernel | cosine vs fp32 reference | >= 0.9999999 |
+| VAE `fp16_rms_silu_amax_ndhwc` kernel | amax vs fp32 reference | exact (atomicMax on non-negative floats) |
 | VAE `fp8_conv3d_mm` kernel | cosine vs fp16 F.conv3d | >= 0.9993 (per-layer) |
-| End-to-end FP8 + VAE opt + CL + FP8 conv3d (full-frame) | PSNR vs fp16 ref | 39.3 dB (median) / >= 36.5 dB (worst frame) |
+| End-to-end FP8 + VAE opt + CL + FP8 conv3d (full-frame) | PSNR vs fp16 ref | 39.9 dB (median) / >= 36.4 dB (worst frame) |
 | End-to-end FP8 + VAE opt + CL only (no FP8 conv3d) | PSNR vs fp16 ref | 40.8 dB (median) / >= 37.0 dB (worst frame) |
 | Attention — SageAttention QK-int8 PV-fp8 (`sage_fp8`, default) | cosine vs SDPA | 0.9993 |
 | Attention — SageAttention QK-int8 PV-fp16 (`sage_fp16`) | cosine vs SDPA | 0.9999 |
@@ -337,8 +356,8 @@ the steady state; the FP8 path calibrates on the first call then freezes.
 
 | Flag | Default | Effect |
 |------|---------|--------|
-| `--vae-opt` / `--no-vae-opt` | **enabled** | Install FlashRT fp16 fused VAE kernels (`fp16_rms_norm_ncdhw`, `fp16_rms_silu_ncdhw`, NDHWC variants) + channels-last 3D pipeline (Conv3d weights → CL, eliminates nchw↔nhwc conversion) + FP8 implicit-GEMM conv3d + `WanUpsample` cast elimination. Requires the `flash_rt_minimax_remover` module. |
-| `--fp8-conv` / `--no-fp8-conv` | **enabled** | Use FP8 implicit-GEMM conv3d kernel for applicable 3×3×3 causal convs (requires `--vae-opt`). Trades ~1.5 dB PSNR for ~13% decode speedup. |
+| `--vae-opt` / `--no-vae-opt` | **enabled** | Install FlashRT fp16 fused VAE kernels (`fp16_rms_norm_ncdhw`, `fp16_rms_silu_ncdhw`, NDHWC variants, fused norm+silu+amax) + channels-last 3D pipeline + running-max amax sharing between norm and conv + FP8 implicit-GEMM conv3d + `WanUpsample` cast elimination. Requires the `flash_rt_minimax_remover` module. |
+| `--fp8-conv` / `--no-fp8-conv` | **enabled** | Use FP8 implicit-GEMM conv3d kernel for applicable 3×3×3 causal convs (requires `--vae-opt`). Trades ~1 dB PSNR for ~14% decode speedup over channels-last-only cuDNN. |
 | `--use-fp4` | off | Use NVFP4 (W4A4) instead of the default FP8 (W8A8). Small-region only. |
 | `--no-flashrt` | off | Run the reference diffusers fp16 path (no FlashRT). |
 

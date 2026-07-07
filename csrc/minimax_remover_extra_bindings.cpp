@@ -18,6 +18,7 @@
 #include "kernels/minimax_remover/fp16_rms_norm_ndhwc.cuh"
 #include "kernels/minimax_remover/fp8_conv3d_mm_ndhwc_fp16out.cuh"
 #include "kernels/minimax_remover/fp16_quant_fp8_per_tensor.cuh"
+#include "kernels/minimax_remover/fp16_rms_silu_fp8_ndhwc.cuh"
 
 namespace py = pybind11;
 
@@ -163,4 +164,88 @@ PYBIND11_MODULE(flash_rt_minimax_remover, m) {
         py::arg("n"), py::arg("stream") = 0,
         "Quantize fp16→fp8 using pre-computed amax in amax_buf. "
         "Writes float scale to scale_out.");
+
+    // ── Dual quantize: two buffers, one shared amax, one launch ──
+    m.def("quantize_fp16_fp8_with_amax_dual",
+        [](uintptr_t x1_fp16, uintptr_t y1_fp8, int n1,
+           uintptr_t x2_fp16, uintptr_t y2_fp8, int n2,
+           uintptr_t amax_buf, uintptr_t scale_out,
+           uintptr_t stream) {
+            return flash_rt::kernels::minimax_remover::
+                quantize_fp16_fp8_with_amax_dual(
+                to_ptr(x1_fp16), to_ptr(y1_fp8), n1,
+                to_ptr(x2_fp16), to_ptr(y2_fp8), n2,
+                to_ptr(amax_buf),
+                scale_out ? to_ptr(scale_out) : nullptr,
+                to_stream(stream));
+        },
+        py::arg("x1_fp16"), py::arg("y1_fp8"), py::arg("n1"),
+        py::arg("x2_fp16"), py::arg("y2_fp8"), py::arg("n2"),
+        py::arg("amax_buf"), py::arg("scale_out") = 0,
+        py::arg("stream") = 0,
+        "Dual quantize: two fp16 buffers → fp8 with shared amax in "
+        "one kernel launch. Saves one launch vs two separate calls.");
+
+    // ── Fused norm+silu+amax / norm+silu+quant_fp8 (NDHWC) ──
+    m.def("fp16_rms_silu_amax_ndhwc",
+        [](uintptr_t x_fp16, uintptr_t gamma_fp16, uintptr_t bias_fp16,
+           uintptr_t y_fp16, uintptr_t amax_buf,
+           int B, int C, int T, int H, int W,
+           float eps, uintptr_t stream) {
+            return flash_rt::kernels::minimax_remover::
+                fp16_rms_silu_amax_ndhwc(
+                to_ptr(x_fp16), to_ptr(gamma_fp16),
+                bias_fp16 ? to_ptr(bias_fp16) : nullptr,
+                to_ptr(y_fp16), to_ptr(amax_buf),
+                B, C, T, H, W, eps, to_stream(stream));
+        },
+        py::arg("x_fp16"), py::arg("gamma_fp16"), py::arg("bias_fp16"),
+        py::arg("y_fp16"), py::arg("amax_buf"),
+        py::arg("B"), py::arg("C"), py::arg("T"), py::arg("H"), py::arg("W"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "Fused FP16 NDHWC RMSNorm+SiLU+amax. Writes fp16 output and "
+        "accumulates |output| into amax_buf via atomicMax (caller must "
+        "zero amax_buf before first call). Saves one full read of y "
+        "vs separate norm+silu then amax.");
+
+    m.def("fp16_rms_silu_quant_fp8_ndhwc",
+        [](uintptr_t x_fp16, uintptr_t gamma_fp16, uintptr_t bias_fp16,
+           uintptr_t y_fp8, uintptr_t amax_buf, uintptr_t scale_out,
+           int B, int C, int T, int H, int W,
+           float eps, uintptr_t stream) {
+            return flash_rt::kernels::minimax_remover::
+                fp16_rms_silu_quant_fp8_ndhwc(
+                to_ptr(x_fp16), to_ptr(gamma_fp16),
+                bias_fp16 ? to_ptr(bias_fp16) : nullptr,
+                to_ptr(y_fp8), to_ptr(amax_buf),
+                scale_out ? to_ptr(scale_out) : nullptr,
+                B, C, T, H, W, eps, to_stream(stream));
+        },
+        py::arg("x_fp16"), py::arg("gamma_fp16"), py::arg("bias_fp16"),
+        py::arg("y_fp8"), py::arg("amax_buf"), py::arg("scale_out") = 0,
+        py::arg("B"), py::arg("C"), py::arg("T"), py::arg("H"), py::arg("W"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "Fused FP16 NDHWC RMSNorm+SiLU → FP8 e4m3 quantize. Reads "
+        "pre-computed amax from device. Does NOT write fp16 output — "
+        "eliminates the fp16 intermediate between norm and conv.");
+
+    m.def("fp16_rms_silu_amax_quant_fp8_ndhwc",
+        [](uintptr_t x_fp16, uintptr_t gamma_fp16, uintptr_t bias_fp16,
+           uintptr_t y_fp8, uintptr_t scale_out, uintptr_t amax_buf,
+           int B, int C, int T, int H, int W,
+           float eps, uintptr_t stream) {
+            return flash_rt::kernels::minimax_remover::
+                fp16_rms_silu_amax_quant_fp8_ndhwc(
+                to_ptr(x_fp16), to_ptr(gamma_fp16),
+                bias_fp16 ? to_ptr(bias_fp16) : nullptr,
+                to_ptr(y_fp8), to_ptr(scale_out), to_ptr(amax_buf),
+                B, C, T, H, W, eps, to_stream(stream));
+        },
+        py::arg("x_fp16"), py::arg("gamma_fp16"), py::arg("bias_fp16"),
+        py::arg("y_fp8"), py::arg("scale_out"), py::arg("amax_buf"),
+        py::arg("B"), py::arg("C"), py::arg("T"), py::arg("H"), py::arg("W"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "2-pass fused norm+silu+amax+quant → FP8. Pass 1 computes amax "
+        "(no write); pass 2 re-reads x and quantizes. Produces ONLY fp8 "
+        "output + scale, no fp16 intermediate.");
 }
