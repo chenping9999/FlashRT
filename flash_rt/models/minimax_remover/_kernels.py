@@ -280,3 +280,80 @@ def latent_denormalize(x, mean_param, inv_std_param):
     _latent_affine_kernel[grid](x, mean_param, out, n, inv_std_val, False,
                                 BLOCK=4096, IO_DTYPE=_io_dtype(x))
     return out
+
+
+# ── WanRMS_norm for NCDHW VAE activations (fp16 in/out, fp32 stats) ──────
+#
+# Replaces diffusers WanRMS_norm.forward which does:
+#   x.float() -> F.normalize(x, dim=1) -> .to(fp16) -> * sqrt(C) * gamma + bias
+# (4 full-tensor passes) with a 2-pass Triton kernel that:
+#   pass 1: accumulate sum(x^2) across channel axis in fp32
+#   pass 2: x * (sqrt(C) / sqrt(sum_sq/C + eps)) * gamma + bias -> fp16
+#
+# Each program handles ONE spatial location (b, t, h, w); channels are
+# accessed with stride = T*H*W (NCDHW layout). BLOCK_C must be >= C; in
+# the VAE C ∈ {96, 192, 384} so a single-block load covers all channels.
+
+@triton.jit
+def _wan_rms_norm_kernel(X, GAMMA, BIAS, OUT,
+                         C, stride_c, SCALE, EPS,
+                         BLOCK_C: tl.constexpr, IO_DTYPE: tl.constexpr):
+    pid = tl.program_id(0)
+    x_base = X + pid
+    o_base = OUT + pid
+    cols = tl.arange(0, BLOCK_C)
+    mask = cols < C
+
+    # Pass 1: load all C channels (strided), compute sum of squares in fp32.
+    x = tl.load(x_base + cols * stride_c, mask=mask, other=0.0).to(tl.float32)
+    sum_sq = tl.sum(x * x)
+    inv_rms = SCALE * (1.0 / tl.sqrt(sum_sq / C + EPS))
+
+    # Pass 2: normalize + affine, store as fp16.
+    g = tl.load(GAMMA + cols, mask=mask, other=0.0).to(tl.float32)
+    b_val = tl.load(BIAS + cols, mask=mask, other=0.0).to(tl.float32)
+    y = x * inv_rms * g + b_val
+    tl.store(o_base + cols * stride_c, y.to(IO_DTYPE), mask=mask)
+
+
+def wan_rms_norm_ncdhw(x, gamma, bias, scale, eps=1e-6):
+    """Fused WanRMS_norm for NCDHW/NCHW activations.
+
+    Computes: y = F.normalize(x, dim=1) * scale * gamma + bias
+    which equals: y = (x / rms(x)) * gamma + bias  (RMS normalization).
+
+    Args:
+        x: fp16/bf16 tensor, 4D [B,C,H,W] or 5D [B,C,T,H,W], NCDHW layout.
+        gamma: [C,1,1,1] or [C,1,1] affine weight (WanRMS_norm.gamma).
+        bias: [C,1,1,1] or [C,1,1] or scalar 0.0.
+        scale: python float = sqrt(C).
+        eps: small constant (default 1e-6).
+
+    Returns:
+        Same shape/dtype as x.
+    """
+    C = x.shape[1]
+    if x.dim() == 5:
+        B, _, T, H, W = x.shape
+        n_spatial = B * T * H * W
+    else:
+        B, _, H, W = x.shape
+        T = 1
+        n_spatial = B * H * W
+
+    stride_c = x.stride(1)
+    g = gamma.contiguous().to(torch.float32).view(-1)
+    if isinstance(bias, torch.Tensor):
+        b_vec = bias.contiguous().to(torch.float32).view(-1)
+    else:
+        b_vec = torch.zeros(C, dtype=torch.float32, device=x.device)
+
+    out = torch.empty_like(x)
+    BLOCK_C = triton.next_power_of_2(min(C, 1024))
+    while BLOCK_C < C:
+        BLOCK_C <<= 1
+    _wan_rms_norm_kernel[(n_spatial,)](
+        x, g, b_vec, out, C, stride_c, float(scale), float(eps),
+        BLOCK_C=BLOCK_C, num_warps=min(8, max(1, BLOCK_C // 32)),
+        IO_DTYPE=_io_dtype(x))
+    return out

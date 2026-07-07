@@ -190,6 +190,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #ifdef FLASHRT_HAVE_MOTUS_VAE_FP8
 #include "quantize/bf16_rms_silu_quant_fp8_ncdhw_to_ndhwc_v4.cuh"
 #include "quantize/bf16_rms_silu_ncdhw.cuh"
+#include "quantize/fp16_rms_norm_ncdhw.cuh"
 #include "quantize/bf16_ndhwc_to_ncdhw_transpose.cuh"
 #include "quantize/bf16_quant_fp8_ncdhw_to_ndhwc.cuh"
 #endif
@@ -3501,6 +3502,20 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         },
         py::arg("x_bf16"), py::arg("gamma_bf16"), py::arg("bias_bf16"),
         py::arg("y_bf16"),
+        py::arg("B"), py::arg("C"), py::arg("T"), py::arg("H"), py::arg("W"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+
+    m.def("fp16_rms_norm_ncdhw",
+        [](uintptr_t x_fp16, uintptr_t gamma_fp16, uintptr_t bias_fp16,
+           uintptr_t y_fp16, int B, int C, int T, int H, int W,
+           float eps, uintptr_t stream) {
+            return flash_rt::quantize::fp16_rms_norm_ncdhw(
+                to_ptr(x_fp16), to_ptr(gamma_fp16),
+                bias_fp16 ? to_ptr(bias_fp16) : nullptr,
+                to_ptr(y_fp16), B, C, T, H, W, eps, to_stream(stream));
+        },
+        py::arg("x_fp16"), py::arg("gamma_fp16"), py::arg("bias_fp16"),
+        py::arg("y_fp16"),
         py::arg("B"), py::arg("C"), py::arg("T"), py::arg("H"), py::arg("W"),
         py::arg("eps") = 1e-6f, py::arg("stream") = 0);
 

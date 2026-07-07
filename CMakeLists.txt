@@ -1147,7 +1147,8 @@ if(NOT FLASHRT_SLIM_BUILD)
     csrc/quantize/bf16_ndhwc_to_ncdhw_transpose.cu
     csrc/quantize/bf16_quant_fp8_ncdhw_to_ndhwc.cu
     csrc/quantize/bf16_rms_silu_ncdhw.cu
-    csrc/quantize/bf16_rms_silu_quant_fp8_ncdhw_to_ndhwc_v4.cu)
+    csrc/quantize/bf16_rms_silu_quant_fp8_ncdhw_to_ndhwc_v4.cu
+    csrc/quantize/fp16_rms_norm_ncdhw.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_MOTUS_VAE_FP8=1)
   message(STATUS "Motus VAE FP8 quantize kernels: ENABLED")
 else()

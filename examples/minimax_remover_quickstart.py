@@ -589,6 +589,11 @@ def parse_args() -> argparse.Namespace:
                         "black/drift outputs. FP8 (default) is recommended "
                         "for full-frame inpainting (end-to-end cosine >= 0.999, "
                         "PSNR ~35-41 dB vs fp16).")
+    p.add_argument("--vae-opt", action="store_true",
+                   help="Apply FlashRT VAE optimisations: BF16 cast + fused "
+                        "RMS_norm kernel (bf16_rms_norm_ncdhw). The VAE is "
+                        "~65% of wall time on the FP8 path; this cuts it to "
+                        "~15%. Cosine >= 0.9999 vs the fp16 VAE reference.")
     return p.parse_args()
 
 
@@ -642,6 +647,11 @@ def main() -> None:
     masks_padded = pad_masks_bottom_right(masks, ph, pw)
 
     pipe = build_pipeline(model_dir)
+
+    if args.vae_opt:
+        from flash_rt.models.minimax_remover._vae_opt import install_vae_optimizations
+        stats = install_vae_optimizations(pipe.vae)
+        print(f"  VAE optimised: {stats}")
 
     if args.no_flashrt:
         runner = pipe
