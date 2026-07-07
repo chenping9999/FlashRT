@@ -965,7 +965,8 @@ if(FLASHRT_ENABLE_MINIMAX_REMOVER)
   pybind11_add_module(flash_rt_minimax_remover
     csrc/minimax_remover_extra_bindings.cpp
     csrc/kernels/minimax_remover/fp16_rms_norm_ncdhw.cu
-    csrc/kernels/minimax_remover/fp16_rms_silu_ncdhw.cu)
+    csrc/kernels/minimax_remover/fp16_rms_silu_ncdhw.cu
+    csrc/kernels/minimax_remover/fp16_rms_norm_ndhwc.cu)
   set_target_properties(flash_rt_minimax_remover PROPERTIES
     CUDA_STANDARD 17
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
