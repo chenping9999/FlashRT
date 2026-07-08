@@ -147,7 +147,8 @@ class FlashRTFA2Processor:
         self._cos_sin = {}
 
     def __call__(self, attn, hidden_states, rotary_emb=None,
-                 attention_mask=None, encoder_hidden_states=None):
+                 attention_mask=None, encoder_hidden_states=None,
+                 no_out_bias=False):
         mode = _attention_mode()
         B, S, _ = hidden_states.shape
         H = attn.heads
@@ -185,7 +186,11 @@ class FlashRTFA2Processor:
                                 lse_cache=self._lse_bufs)
 
         hidden_states = out.view(B, S, H * Dd)
-        hidden_states = attn.to_out[0](hidden_states)
+        to_out0 = attn.to_out[0]
+        if no_out_bias and hasattr(to_out0, "gemm_no_bias"):
+            hidden_states = to_out0.gemm_no_bias(hidden_states)
+        else:
+            hidden_states = to_out0(hidden_states)
         return hidden_states
 
 

@@ -103,6 +103,25 @@ def install_fused_blocks(transformer, norm_mode=None, gelu_mode=None):
             out.data_ptr(), S, D, eps, stream_of())
         return out
 
+    _has_bgr = (_fvk is not None
+                and hasattr(_fvk, "fp16_bias_gate_residual_bcast")
+                and os.environ.get("FLASHRT_DISABLE_BIAS_GATE", "0") != "1")
+
+    def _gate_residual_apply(hs, x_no_bias, bias, gate, S, D):
+        """residual += (x + bias) * gate[D]  — one fused kernel if available,
+        else falls back to add_bias_fp16 + gate_mul_residual_bcast."""
+        if _has_bgr and bias is not None and (D & 7) == 0:
+            gate_fp16 = gate.to(_FP16).contiguous().view(D)
+            _fvk.fp16_bias_gate_residual_bcast(
+                x_no_bias.data_ptr(), bias.data_ptr(),
+                gate_fp16.data_ptr(), hs.data_ptr(),
+                S, D, stream_of())
+        else:
+            if bias is not None:
+                kern.add_bias_fp16(x_no_bias.data_ptr(), bias.data_ptr(),
+                                   S, D, stream_of())
+            gate_mul_residual_bcast(hs, x_no_bias, gate.view(D))
+
     def block_forward(self, hidden_states, temb, rotary_emb):
         B, S, D = hidden_states.shape
         # Ensure contiguity at entry (first block truly copies; subsequent blocks are no-ops)
@@ -115,9 +134,24 @@ def install_fused_blocks(transformer, norm_mode=None, gelu_mode=None):
             norm1_out = _ada_norm_flashrt_fp16(hs, scale_msa, shift_msa, S, D)
         else:
             norm1_out = _ada_norm(hs, scale_msa, shift_msa, S, D)
-        attn_out = self.attn1(hidden_states=norm1_out.view(1, S, D), rotary_emb=rotary_emb).view(S, D)
-        # Broadcast gate[D] (avoids [S,D] expand copy); fp16 in-place
-        gate_mul_residual_bcast(hs, attn_out, gate_msa.view(D))
+        # Fused bias+gate+residual on O-proj: ask attention to skip the
+        # to_out[0] bias, then apply it fused with the gate/residual step.
+        to_out0 = self.attn1.to_out[0]
+        _fuse_attn = (_has_bgr
+                      and hasattr(to_out0, "gemm_no_bias")
+                      and getattr(to_out0, "bias", None) is not None
+                      and not getattr(to_out0, "calibrating", False)
+                      and (D & 7) == 0)
+        if _fuse_attn:
+            attn_out = self.attn1(
+                hidden_states=norm1_out.view(1, S, D),
+                rotary_emb=rotary_emb, no_out_bias=True).view(S, D)
+            _gate_residual_apply(hs, attn_out, to_out0.bias, gate_msa, S, D)
+        else:
+            attn_out = self.attn1(
+                hidden_states=norm1_out.view(1, S, D),
+                rotary_emb=rotary_emb).view(S, D)
+            gate_mul_residual_bcast(hs, attn_out, gate_msa.view(D))
 
         if norm_mode == "fp16":
             norm2_out = _ada_norm_flashrt_fp16(hs, c_scale_msa, c_shift_msa, S, D)
@@ -126,36 +160,48 @@ def install_fused_blocks(transformer, norm_mode=None, gelu_mode=None):
         n2_3d = norm2_out.view(1, S, D)
         if gelu_mode == "torch":
             ff_out = self.ffn(n2_3d).view(S, D)
+            gate_mul_residual_bcast(hs, ff_out, c_gate_msa.view(D))
+            return hs.view(1, S, D)
+
+        proj0 = self.ffn.net[0].proj
+        proj1 = self.ffn.net[2]
+        # Fused FFN epilogue: bias + gelu + quant → fp8 in one kernel.
+        # Only when both Linears are FlashRT FP8, the kernel module is
+        # loaded, scales are frozen (not calibrating), and proj0 has a
+        # bias.  Saves 3 full-tensor fp16 round-trips per block.
+        _can_fuse = (
+            _fvk is not None
+            and hasattr(proj0, "gemm_no_bias")
+            and hasattr(proj1, "forward_from_fp8")
+            and not getattr(proj1, "calibrating", False)
+            and getattr(proj0, "bias", None) is not None
+            and (proj0.out_features & 3) == 0)
+        # Additional fusion of proj1 (FFN-down) bias into gate+residual:
+        # requires the pre-quantised fp8 input path plus gemm_no_bias_from_fp8.
+        _fuse_ffn_down = (_has_bgr and _can_fuse
+                          and hasattr(proj1, "gemm_no_bias_from_fp8")
+                          and getattr(proj1, "bias", None) is not None
+                          and (D & 7) == 0)
+        if _can_fuse:
+            raw = proj0.gemm_no_bias(n2_3d)        # quant+GEMM, no bias → fp16 [1,S,inner]
+            inner = raw.shape[-1]
+            up_fp8 = torch.empty(
+                S, inner, dtype=torch.float8_e4m3fn, device=raw.device)
+            _fvk.bias_gelu_quant_fp16_fp8(
+                raw.data_ptr(), proj0.bias.data_ptr(),
+                up_fp8.data_ptr(), proj1.act_scale.data_ptr(),
+                S, inner, stream_of())
+            if _fuse_ffn_down:
+                ff_out = proj1.gemm_no_bias_from_fp8(up_fp8).view(S, D)
+                _gate_residual_apply(hs, ff_out, proj1.bias, c_gate_msa, S, D)
+                return hs.view(1, S, D)
+            ff_out = proj1.forward_from_fp8(up_fp8).view(S, D)
         else:
-            proj0 = self.ffn.net[0].proj
-            proj1 = self.ffn.net[2]
-            # Fused FFN epilogue: bias + gelu + quant → fp8 in one kernel.
-            # Only when both Linears are FlashRT FP8, the kernel module is
-            # loaded, scales are frozen (not calibrating), and proj0 has a
-            # bias.  Saves 3 full-tensor fp16 round-trips per block.
-            _can_fuse = (
-                _fvk is not None
-                and hasattr(proj0, "gemm_no_bias")
-                and hasattr(proj1, "forward_from_fp8")
-                and not getattr(proj1, "calibrating", False)
-                and getattr(proj0, "bias", None) is not None
-                and (proj0.out_features & 3) == 0)
-            if _can_fuse:
-                raw = proj0.gemm_no_bias(n2_3d)        # quant+GEMM, no bias → fp16 [1,S,inner]
-                inner = raw.shape[-1]
-                up_fp8 = torch.empty(
-                    S, inner, dtype=torch.float8_e4m3fn, device=raw.device)
-                _fvk.bias_gelu_quant_fp16_fp8(
-                    raw.data_ptr(), proj0.bias.data_ptr(),
-                    up_fp8.data_ptr(), proj1.act_scale.data_ptr(),
-                    S, inner, stream_of())
-                ff_out = proj1.forward_from_fp8(up_fp8).view(S, D)
-            else:
-                up = proj0(n2_3d)
-                inner = up.shape[-1]
-                _gelu_fn = kern.gelu_inplace if up.dtype == torch.bfloat16 else kern.gelu_inplace_fp16
-                _gelu_fn(up.data_ptr(), S * inner, stream_of())
-                ff_out = proj1(up).view(S, D)
+            up = proj0(n2_3d)
+            inner = up.shape[-1]
+            _gelu_fn = kern.gelu_inplace if up.dtype == torch.bfloat16 else kern.gelu_inplace_fp16
+            _gelu_fn(up.data_ptr(), S * inner, stream_of())
+            ff_out = proj1(up).view(S, D)
         gate_mul_residual_bcast(hs, ff_out, c_gate_msa.view(D))
         return hs.view(1, S, D)
 

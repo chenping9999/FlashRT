@@ -20,6 +20,7 @@
 #include "kernels/minimax_remover/fp16_quant_fp8_per_tensor.cuh"
 #include "kernels/minimax_remover/fp16_rms_silu_fp8_ndhwc.cuh"
 #include "kernels/minimax_remover/fp16_bias_gelu_quant_fp8.cuh"
+#include "kernels/minimax_remover/fp16_bias_gate_residual.cuh"
 
 namespace py = pybind11;
 
@@ -282,4 +283,36 @@ PYBIND11_MODULE(flash_rt_minimax_remover, m) {
         py::arg("stream") = 0,
         "Fused: fp16 GEMM-out + bias → fp8 e4m3 (identity activation). "
         "For Linear→Linear chains with no activation in between.");
+
+    // ── Fused bias + gate·residual (eliminates the mid-block bias-add RMW) ──
+    m.def("fp16_bias_gate_residual_bcast",
+        [](uintptr_t out_fp16, uintptr_t bias_fp16, uintptr_t gate_fp16,
+           uintptr_t residual_fp16, int M, int D, uintptr_t stream) {
+            return flash_rt::kernels::minimax_remover::
+                fp16_bias_gate_residual_bcast(
+                to_ptr(out_fp16), to_ptr(bias_fp16), to_ptr(gate_fp16),
+                to_ptr(residual_fp16), M, D, to_stream(stream));
+        },
+        py::arg("out_fp16"), py::arg("bias_fp16"),
+        py::arg("gate_fp16"), py::arg("residual_fp16"),
+        py::arg("M"), py::arg("D"),
+        py::arg("stream") = 0,
+        "Fused: residual[m,d] += (out[m,d] + bias[d]) * gate[d]. "
+        "Replaces add_bias_fp16 + gate_mul_residual_bcast (2 kernels → 1) "
+        "for the O-proj and FFN-down slots — cuts one full [M,D] fp16 "
+        "read-modify-write per call.  D must be a multiple of 8.");
+
+    m.def("fp16_add_bias_vec8",
+        [](uintptr_t x_fp16, uintptr_t bias_fp16,
+           int M, int D, uintptr_t stream) {
+            return flash_rt::kernels::minimax_remover::fp16_add_bias_vec8(
+                to_ptr(x_fp16), to_ptr(bias_fp16), M, D, to_stream(stream));
+        },
+        py::arg("x_fp16"), py::arg("bias_fp16"),
+        py::arg("M"), py::arg("D"),
+        py::arg("stream") = 0,
+        "Vectorised (fp16x8) in-place add_bias: x[m,d] += bias[d]. "
+        "Replaces the scalar decoder_fused add_bias_fp16 kernel for the "
+        "Q/K/V projections; ~8× fewer memory transactions.  D must be "
+        "a multiple of 8.");
 }

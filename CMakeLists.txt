@@ -970,7 +970,8 @@ if(FLASHRT_ENABLE_MINIMAX_REMOVER)
     csrc/kernels/minimax_remover/fp8_conv3d_mm_ndhwc_fp16out.cu
   csrc/kernels/minimax_remover/fp16_quant_fp8_per_tensor.cu
   csrc/kernels/minimax_remover/fp16_rms_silu_fp8_ndhwc.cu
-  csrc/kernels/minimax_remover/fp16_bias_gelu_quant_fp8.cu)
+  csrc/kernels/minimax_remover/fp16_bias_gelu_quant_fp8.cu
+  csrc/kernels/minimax_remover/fp16_bias_gate_residual.cu)
   set_target_properties(flash_rt_minimax_remover PROPERTIES
     CUDA_STANDARD 17
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
@@ -986,7 +987,7 @@ if(FLASHRT_ENABLE_MINIMAX_REMOVER)
       -U__CUDA_NO_HALF_CONVERSIONS__
       ${GPU_GENCODE}
     >)
-  target_link_libraries(flash_rt_minimax_remover PRIVATE CUDA::cudart)
+  target_link_libraries(flash_rt_minimax_remover PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt)
   install(TARGETS flash_rt_minimax_remover LIBRARY DESTINATION flash_rt)
   message(STATUS "MiniMax-Remover VAE fused kernels: ENABLED")
 else()
