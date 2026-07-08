@@ -107,6 +107,13 @@ def install_fused_blocks(transformer, norm_mode=None, gelu_mode=None):
                 and hasattr(_fvk, "fp16_bias_gate_residual_bcast")
                 and os.environ.get("FLASHRT_DISABLE_BIAS_GATE", "0") != "1")
 
+    # Fused adaLN + fp8 quantise kernel — feeds Q/K/V from a shared fp8
+    # tensor built with max(act_scale_q, act_scale_k, act_scale_v).  Saves
+    # three activation-quantise passes and one full fp16 read of norm1.
+    _fuse_ada_qkv = (_fvk is not None
+                     and hasattr(_fvk, "fp16_ada_layernorm_quant_fp8")
+                     and os.environ.get("FLASHRT_DISABLE_ADA_QKV", "0") != "1")
+
     def _gate_residual_apply(hs, x_no_bias, bias, gate, S, D):
         """residual += (x + bias) * gate[D]  — one fused kernel if available,
         else falls back to add_bias_fp16 + gate_mul_residual_bcast."""
@@ -122,6 +129,21 @@ def install_fused_blocks(transformer, norm_mode=None, gelu_mode=None):
                                    S, D, stream_of())
             gate_mul_residual_bcast(hs, x_no_bias, gate.view(D))
 
+    def _get_qkv_shared_scale(block):
+        """Cache & return the fp32[1] max(to_q, to_k, to_v).act_scale for
+        the attn1 sub-module of `block`.  Persists across denoise steps
+        (scales are frozen after calibration)."""
+        cached = getattr(block, "_flashrt_qkv_shared_scale", None)
+        if cached is not None:
+            return cached
+        attn = block.attn1
+        s = torch.stack([attn.to_q.act_scale.view(1),
+                         attn.to_k.act_scale.view(1),
+                         attn.to_v.act_scale.view(1)]).max().view(1)
+        s = s.to(torch.float32).contiguous()
+        block._flashrt_qkv_shared_scale = s
+        return s
+
     def block_forward(self, hidden_states, temb, rotary_emb):
         B, S, D = hidden_states.shape
         # Ensure contiguity at entry (first block truly copies; subsequent blocks are no-ops)
@@ -130,27 +152,50 @@ def install_fused_blocks(transformer, norm_mode=None, gelu_mode=None):
         (shift_msa, scale_msa, gate_msa,
          c_shift_msa, c_scale_msa, c_gate_msa) = (self.scale_shift_table + temb.float()).chunk(6, dim=1)
 
-        if norm_mode == "fp16":
-            norm1_out = _ada_norm_flashrt_fp16(hs, scale_msa, shift_msa, S, D)
-        else:
-            norm1_out = _ada_norm(hs, scale_msa, shift_msa, S, D)
-        # Fused bias+gate+residual on O-proj: ask attention to skip the
-        # to_out[0] bias, then apply it fused with the gate/residual step.
-        to_out0 = self.attn1.to_out[0]
+        # ── norm1 → attn ────────────────────────────────────────
+        attn = self.attn1
+        to_out0 = attn.to_out[0]
+        _fuse_qkv = (_fuse_ada_qkv
+                     and norm_mode != "fp16"
+                     and hasattr(attn.to_q, "gemm_from_fp8_ext")
+                     and hasattr(attn.to_k, "gemm_from_fp8_ext")
+                     and hasattr(attn.to_v, "gemm_from_fp8_ext")
+                     and not getattr(attn.to_q, "calibrating", False)
+                     and (D & 7) == 0)
         _fuse_attn = (_has_bgr
                       and hasattr(to_out0, "gemm_no_bias")
                       and getattr(to_out0, "bias", None) is not None
                       and not getattr(to_out0, "calibrating", False)
                       and (D & 7) == 0)
+
+        if _fuse_qkv:
+            shared_scale = _get_qkv_shared_scale(self)
+            # Ensure fp32 contiguous scale/shift vectors for the kernel.
+            scale_f = scale_msa.contiguous().to(torch.float32).view(D)
+            shift_f = shift_msa.contiguous().to(torch.float32).view(D)
+            norm1_fp8 = torch.empty(S, D, dtype=torch.float8_e4m3fn,
+                                    device=hs.device)
+            _fvk.fp16_ada_layernorm_quant_fp8(
+                hs.data_ptr(), scale_f.data_ptr(), shift_f.data_ptr(),
+                shared_scale.data_ptr(), norm1_fp8.data_ptr(),
+                S, D, eps, stream_of())
+            attn_out = attn(hidden_states=hs.view(1, S, D),
+                            rotary_emb=rotary_emb,
+                            no_out_bias=_fuse_attn,
+                            fp8_hidden=norm1_fp8,
+                            fp8_scale=shared_scale).view(S, D)
+        else:
+            if norm_mode == "fp16":
+                norm1_out = _ada_norm_flashrt_fp16(hs, scale_msa, shift_msa, S, D)
+            else:
+                norm1_out = _ada_norm(hs, scale_msa, shift_msa, S, D)
+            attn_out = attn(hidden_states=norm1_out.view(1, S, D),
+                            rotary_emb=rotary_emb,
+                            no_out_bias=_fuse_attn).view(S, D)
+
         if _fuse_attn:
-            attn_out = self.attn1(
-                hidden_states=norm1_out.view(1, S, D),
-                rotary_emb=rotary_emb, no_out_bias=True).view(S, D)
             _gate_residual_apply(hs, attn_out, to_out0.bias, gate_msa, S, D)
         else:
-            attn_out = self.attn1(
-                hidden_states=norm1_out.view(1, S, D),
-                rotary_emb=rotary_emb).view(S, D)
             gate_mul_residual_bcast(hs, attn_out, gate_msa.view(D))
 
         if norm_mode == "fp16":

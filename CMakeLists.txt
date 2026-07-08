@@ -971,7 +971,9 @@ if(FLASHRT_ENABLE_MINIMAX_REMOVER)
   csrc/kernels/minimax_remover/fp16_quant_fp8_per_tensor.cu
   csrc/kernels/minimax_remover/fp16_rms_silu_fp8_ndhwc.cu
   csrc/kernels/minimax_remover/fp16_bias_gelu_quant_fp8.cu
-  csrc/kernels/minimax_remover/fp16_bias_gate_residual.cu)
+  csrc/kernels/minimax_remover/fp16_bias_gate_residual.cu
+  csrc/kernels/minimax_remover/fp16_ada_layernorm_quant_fp8.cu
+  csrc/kernels/minimax_remover/fp16_rmsnorm_rope.cu)
   set_target_properties(flash_rt_minimax_remover PROPERTIES
     CUDA_STANDARD 17
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt

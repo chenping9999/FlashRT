@@ -71,6 +71,8 @@ cmake --build build -j --target flash_rt_minimax_remover
 | `bias_quant_fp16_fp8` | `flash_rt_minimax_remover` | `add_bias_fp16` + `quantize_fp8_static_fp16` (identity activation variant) | fused bias + quant for Linear→Linear chains with no activation |
 | `fp16_bias_gate_residual_bcast` | `flash_rt_minimax_remover` | transformer O-proj / FFN-down `add_bias_fp16` + `gate_mul_residual_bcast` (2 kernels) | fused single-pass fp16x8 (uint4) kernel: `residual[m,d] += (out[m,d] + bias[d]) * gate[d]`; eliminates one full [S,D] fp16 read-modify-write per call (~720 slots / denoise) |
 | `fp16_add_bias_vec8` | `flash_rt_minimax_remover` | scalar `add_bias_fp16` (decoder_fused) | vectorised fp16x8 (uint4) in-place bias add; used for Q/K/V and any bias-only slot; ~8× fewer memory transactions |
+| `fp16_ada_layernorm_quant_fp8` | `flash_rt_minimax_remover` | Triton `ada_layernorm_fp16_io` + `quantize_fp8_static_fp16` + 3× per-Linear activation quant (Q/K/V) | fused single-pass fp32-stat LayerNorm + adaLN modulation + per-tensor FP8 quantise; feeds a shared-scale FP8 tensor into Q/K/V (one quantise for three Linears, three descales) |
+| `fp16_rmsnorm_rope_bshd` | `flash_rt_minimax_remover` | Triton `rms_norm_fp32stat` + `rope_apply_bshd` (2 kernels, 2 full R/W of Q or K) | fused per-token RMSNorm (fp32 stats + fp16 affine) + interleaved RoPE on native [B,S,H,Dd] fp16 layout; one full R/W per tensor; skips the intermediate fp16 write of the normalised Q/K |
 | channels-last pipeline | Python (`_vae_opt.py`) | Conv3d weight → CL, WanCausalConv3d → CL-preserving forward | eliminates ~97% of nchw↔nhwc conversion kernels (~280 ms / decode) |
 | Running-max amax | Python (`_vae_opt.py`) | separate `amax_fp16` calls over cache + new each iteration | norm fuses amax via atomicMax into a persistent buffer shared with the sister conv; cache amax is skipped entirely (covered by running max) |
 | `WanUpsample` patch | Python (no kernel) | `x.float().type_as(x)` for nearest-exact upsample | eliminates redundant fp32 cast (index-only op, fp16 == fp32) |
@@ -338,7 +340,8 @@ All rows compare against the non-FlashRT `--no-flashrt` fp16 reference on the
 | tennis (70 frames, 432x240) | FlashRT FP8 + VAE opt + CL (`--no-fp8-conv`) | 10.01 s | 1.73x | 40.8 / 37.0 dB | 0.99981 |
 | tennis (70 frames, 432x240) | FlashRT FP8 + VAE opt + CL + FP8 conv3d | 8.58 s | 2.02x | 39.9 / 36.4 dB | 0.99981 |
 | tennis (70 frames, 432x240) | FlashRT FP8 + VAE opt + CL + FP8 conv3d + fused FFN epilogue | 7.56 s | 2.29x | 40.0 / 36.4 dB | 0.99981 |
-| tennis (70 frames, 432x240) | **FlashRT FP8 + VAE opt + CL + FP8 conv3d + fused FFN epilogue + fused bias-gate residual (default)** | **7.57 s** | **2.30x** | **40.0 / 36.2 dB** | 0.99981 |
+| tennis (70 frames, 432x240) | FlashRT FP8 + VAE opt + CL + FP8 conv3d + fused FFN epilogue + fused bias-gate residual | 7.57 s | 2.30x | 40.0 / 36.2 dB | 0.99981 |
+| tennis (70 frames, 432x240) | **… + fused adaLN+quant (shared-scale QKV) + fused RMSNorm+RoPE (default)** | **7.28 s** | **2.38x** | **40.8 / 36.3 dB** | 0.99981 |
 | tennis (70 frames, 432x240) | FlashRT NVFP4 (`--use-fp4`) | 9.52 s | 1.82x | 7.0 / 6.2 dB | 0.00000 (broken) |
 | bmx-trees (80 frames, 432x240) | fp16 reference (`--no-flashrt`) | 19.76 s | 1.0x | — | — |
 | bmx-trees (80 frames, 432x240) | FlashRT FP8 (default) | 13.24 s | **1.49x** | 35.1 / 32.0 dB | 0.99912 |
@@ -350,16 +353,25 @@ All rows compare against the non-FlashRT `--no-flashrt` fp16 reference on the
 
 Takeaways:
 
-- **FP8 + VAE opt + CL + FP8 conv3d + fused FFN epilogue + fused bias-gate residual is the recommended default**: 2.30x
-  faster than the fp16 reference with PSNR 40.0 dB (median) on full-frame
+- **FP8 + VAE opt + CL + FP8 conv3d + fused FFN epilogue + fused bias-gate residual + fused adaLN-quant (shared-scale QKV) + fused RMSNorm+RoPE is the recommended default**: 2.38x
+  faster than the fp16 reference with PSNR 40.8 dB (median) on full-frame
   tennis clip, peak VRAM 2.51 GB. The fused FFN epilogue kernel
   (`bias_gelu_quant_fp16_fp8`) collapses bias-add + GELU + activation
   quantise into one pass, cutting denoise GPU time by 15% (3.73 → 3.16 s)
   and end-to-end from 8.58 → 7.56 s. The fused bias + gate + residual
   kernel (`fp16_bias_gate_residual_bcast`) further collapses the O-proj
   and FFN-down block tails (720 slots / denoise) into single-pass
-  fp16x8 kernels, trimming denoise GPU kernel time another –70 ms;
-  wall time is now launch-bound and unchanged (7.56 → 7.57 s).
+  fp16x8 kernels, trimming denoise GPU kernel time another –70 ms
+  (wall 7.56 → 7.57 s, launch-bound). The fused adaLN+quant kernel
+  (`fp16_ada_layernorm_quant_fp8`) collapses the per-block LayerNorm +
+  adaLN modulation + 3× per-Linear activation quant into a single pass
+  and feeds a **shared-scale FP8 tensor** into Q/K/V (one quantise,
+  three descales), boosting PSNR to 40.8 dB because the shared max
+  scale suppresses per-Linear outlier saturation. The fused
+  `fp16_rmsnorm_rope_bshd` kernel then collapses the Q/K RMSNorm +
+  interleaved RoPE into a single per-token pass, eliminating one full
+  fp16 R/W of each Q/K tensor per attention block. Combined wall time
+  drops 7.57 → 7.28 s (–4%).
 - **FP8 conv3d vs channels-last-only cuDNN**: the hand-rolled implicit-GEMM
   kernel (no im2col materialization, virtual cache concat, per-channel
   weight dequant, fused amax, running-max scale) beats cuDNN's fp16 conv3d

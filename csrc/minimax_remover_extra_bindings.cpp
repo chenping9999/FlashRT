@@ -21,6 +21,8 @@
 #include "kernels/minimax_remover/fp16_rms_silu_fp8_ndhwc.cuh"
 #include "kernels/minimax_remover/fp16_bias_gelu_quant_fp8.cuh"
 #include "kernels/minimax_remover/fp16_bias_gate_residual.cuh"
+#include "kernels/minimax_remover/fp16_ada_layernorm_quant_fp8.cuh"
+#include "kernels/minimax_remover/fp16_rmsnorm_rope.cuh"
 
 namespace py = pybind11;
 
@@ -315,4 +317,48 @@ PYBIND11_MODULE(flash_rt_minimax_remover, m) {
         "Replaces the scalar decoder_fused add_bias_fp16 kernel for the "
         "Q/K/V projections; ~8× fewer memory transactions.  D must be "
         "a multiple of 8.");
+
+    m.def("fp16_ada_layernorm_quant_fp8",
+        [](uintptr_t x_fp16, uintptr_t scale_fp32, uintptr_t shift_fp32,
+           uintptr_t act_scale_fp32, uintptr_t out_fp8,
+           int S, int D, float eps, uintptr_t stream) {
+            return flash_rt::kernels::minimax_remover::
+                fp16_ada_layernorm_quant_fp8(
+                to_ptr(x_fp16), to_ptr(scale_fp32), to_ptr(shift_fp32),
+                to_ptr(act_scale_fp32), to_ptr(out_fp8),
+                S, D, eps, to_stream(stream));
+        },
+        py::arg("x_fp16"), py::arg("scale_fp32"), py::arg("shift_fp32"),
+        py::arg("act_scale_fp32"), py::arg("out_fp8"),
+        py::arg("S"), py::arg("D"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "Fused fp32-stat LayerNorm + adaLN modulation + per-tensor fp8 "
+        "e4m3 quantise.  Reads x[S,D] fp16, applies "
+        "y = (x-mean)/std * (1+scale[d]) + shift[d], then divides by the "
+        "target Linear's static act_scale and casts to fp8_e4m3fn.  "
+        "Replaces the 3-kernel ada_layernorm_fp16_io + quantize_fp8 + "
+        "gemm-descale sequence with a single pass — eliminates the "
+        "intermediate fp16 read of the LayerNorm output.  D must be a "
+        "multiple of 8.");
+
+    m.def("fp16_rmsnorm_rope_bshd",
+        [](uintptr_t x_fp16, uintptr_t weight_fp16,
+           uintptr_t cos_fp32, uintptr_t sin_fp32,
+           int B, int S, int H, int Dd,
+           float eps, uintptr_t stream) {
+            return flash_rt::kernels::minimax_remover::fp16_rmsnorm_rope_bshd(
+                to_ptr(x_fp16), to_ptr(weight_fp16),
+                to_ptr(cos_fp32), to_ptr(sin_fp32),
+                B, S, H, Dd, eps, to_stream(stream));
+        },
+        py::arg("x_fp16"), py::arg("weight_fp16"),
+        py::arg("cos_fp32"), py::arg("sin_fp32"),
+        py::arg("B"), py::arg("S"), py::arg("H"), py::arg("Dd"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "Fused per-token RMSNorm (fp32 stats, fp16 affine) + interleaved "
+        "RoPE on the native [B,S,H,Dd] fp16 layout.  RMS reduction is "
+        "across the full D = H*Dd (matches qk_norm='rms_norm_across_heads'). "
+        "Replaces the 2-kernel rms_norm_fp32stat + rope_apply_bshd Triton "
+        "sequence with one pass — eliminates one full fp16 read+write of "
+        "the Q/K tensor.  Dd must be a multiple of 8.");
 }

@@ -34,6 +34,19 @@ import torch
 
 from ._kernels import rms_norm_fp32stat, rope_apply_bshd, freqs_to_cos_sin
 
+# Optional MiniMax-Remover fused kernels — used when both are available.
+_fvk = None
+try:
+    from flash_rt import flash_rt_minimax_remover as _fvk
+except ImportError:
+    try:
+        import flash_rt_minimax_remover as _fvk  # type: ignore
+    except ImportError:
+        pass
+_has_fused_rmsnorm_rope = (
+    _fvk is not None and hasattr(_fvk, "fp16_rmsnorm_rope_bshd")
+    and os.environ.get("FLASHRT_DISABLE_RMSNORM_ROPE", "0") != "1")
+
 try:
     _NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
 except Exception:
@@ -148,32 +161,71 @@ class FlashRTFA2Processor:
 
     def __call__(self, attn, hidden_states, rotary_emb=None,
                  attention_mask=None, encoder_hidden_states=None,
-                 no_out_bias=False):
+                 no_out_bias=False, fp8_hidden=None, fp8_scale=None):
         mode = _attention_mode()
         B, S, _ = hidden_states.shape
         H = attn.heads
         Dd = attn.inner_dim // H
         scale = 1.0 / math.sqrt(float(Dd))
 
-        q = attn.to_q(hidden_states)
-        k = attn.to_k(hidden_states)
-        v = attn.to_v(hidden_states)
-        if attn.norm_q is not None:
-            q = rms_norm_fp32stat(q, attn.norm_q.weight, attn.norm_q.eps)
-        if attn.norm_k is not None:
-            k = rms_norm_fp32stat(k, attn.norm_k.weight, attn.norm_k.eps)
-
-        q = q.view(B, S, H, Dd)
-        k = k.view(B, S, H, Dd)
-        v = v.view(B, S, H, Dd)
-
+        # ── Fused QKV entry from pre-quantised fp8 input ──
+        # When the caller provides the fp8 output of the fused adaLN+quant
+        # kernel plus the shared scale used to build it, drive Q/K/V from
+        # that fp8 tensor directly — saves 3 activation-quantise passes
+        # (one per Linear) and 1 fp16 read of norm1_out.  Both Linears
+        # must expose gemm_from_fp8_ext (FlashRTFp8Linear post-calibration).
+        _use_fp8 = (fp8_hidden is not None and fp8_scale is not None
+                    and hasattr(attn.to_q, "gemm_from_fp8_ext")
+                    and hasattr(attn.to_k, "gemm_from_fp8_ext")
+                    and hasattr(attn.to_v, "gemm_from_fp8_ext"))
+        if _use_fp8:
+            q = attn.to_q.gemm_from_fp8_ext(fp8_hidden, fp8_scale)
+            k = attn.to_k.gemm_from_fp8_ext(fp8_hidden, fp8_scale)
+            v = attn.to_v.gemm_from_fp8_ext(fp8_hidden, fp8_scale)
+        else:
+            q = attn.to_q(hidden_states)
+            k = attn.to_k(hidden_states)
+            v = attn.to_v(hidden_states)
+        cs = None
         if rotary_emb is not None:
             cs = self._cos_sin.get(S)
             if cs is None:
                 cs = freqs_to_cos_sin(rotary_emb)
                 self._cos_sin[S] = cs
-            rope_apply_bshd(q, cs[0], cs[1])
-            rope_apply_bshd(k, cs[0], cs[1])
+
+        _fuse_qk = (_has_fused_rmsnorm_rope and cs is not None
+                    and attn.norm_q is not None and attn.norm_k is not None
+                    and (Dd & 7) == 0)
+        if _fuse_qk:
+            if not q.is_contiguous():
+                q = q.contiguous()
+            if not k.is_contiguous():
+                k = k.contiguous()
+            stream = torch.cuda.current_stream().cuda_stream
+            _fvk.fp16_rmsnorm_rope_bshd(
+                q.data_ptr(), attn.norm_q.weight.data_ptr(),
+                cs[0].data_ptr(), cs[1].data_ptr(),
+                B, S, H, Dd, float(attn.norm_q.eps), stream)
+            _fvk.fp16_rmsnorm_rope_bshd(
+                k.data_ptr(), attn.norm_k.weight.data_ptr(),
+                cs[0].data_ptr(), cs[1].data_ptr(),
+                B, S, H, Dd, float(attn.norm_k.eps), stream)
+            q = q.view(B, S, H, Dd)
+            k = k.view(B, S, H, Dd)
+            v = v.view(B, S, H, Dd)
+        else:
+            if attn.norm_q is not None:
+                q = rms_norm_fp32stat(q, attn.norm_q.weight, attn.norm_q.eps)
+            if attn.norm_k is not None:
+                k = rms_norm_fp32stat(k, attn.norm_k.weight, attn.norm_k.eps)
+
+            q = q.view(B, S, H, Dd)
+            k = k.view(B, S, H, Dd)
+            v = v.view(B, S, H, Dd)
+
+            if cs is not None:
+                rope_apply_bshd(q, cs[0], cs[1])
+                rope_apply_bshd(k, cs[0], cs[1])
 
         if not q.is_contiguous():
             q = q.contiguous()
