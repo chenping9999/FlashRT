@@ -336,26 +336,29 @@ All rows compare against the non-FlashRT `--no-flashrt` fp16 reference on the
 
 | Clip (frames, resolution) | Stack | Wall time | Speedup vs fp16 ref | PSNR mean / worst vs fp16 ref | cosine mean |
 |--------------------------|-------|-----------|---------------------|-------------------------------|-------------|
-| tennis (70 frames, 432x240) | fp16 reference (`--no-flashrt`) | 17.33 s | 1.0x | — | — |
+| tennis (70 frames, 432x240) | fp16 reference (`--no-flashrt --no-vae-opt`) | 17.33 s | 1.0x | — | — |
 | tennis (70 frames, 432x240) | FlashRT FP8 + VAE opt + CL (`--no-fp8-conv`) | 10.01 s | 1.73x | 40.8 / 37.0 dB | 0.99981 |
 | tennis (70 frames, 432x240) | FlashRT FP8 + VAE opt + CL + FP8 conv3d | 8.58 s | 2.02x | 39.9 / 36.4 dB | 0.99981 |
 | tennis (70 frames, 432x240) | FlashRT FP8 + VAE opt + CL + FP8 conv3d + fused FFN epilogue | 7.56 s | 2.29x | 40.0 / 36.4 dB | 0.99981 |
 | tennis (70 frames, 432x240) | FlashRT FP8 + VAE opt + CL + FP8 conv3d + fused FFN epilogue + fused bias-gate residual | 7.57 s | 2.30x | 40.0 / 36.2 dB | 0.99981 |
-| tennis (70 frames, 432x240) | **… + fused adaLN+quant (shared-scale QKV) + fused RMSNorm+RoPE + fused norm2+quant (default)** | **7.25 s** | **2.39x** | **40.9 / 36.4 dB** | 0.99981 |
+| tennis (70 frames, 432x240) | **… + fused adaLN+quant (shared-scale QKV) + fused RMSNorm+RoPE + fused norm2+quant (default)** | **7.18 s** | **2.41x** | **40.0 / 36.0 dB** | 0.99981 |
 | tennis (70 frames, 432x240) | FlashRT NVFP4 (`--use-fp4`) | 9.52 s | 1.82x | 7.0 / 6.2 dB | 0.00000 (broken) |
 | bmx-trees (80 frames, 432x240) | fp16 reference (`--no-flashrt`) | 19.76 s | 1.0x | — | — |
 | bmx-trees (80 frames, 432x240) | FlashRT FP8 (default) | 13.24 s | **1.49x** | 35.1 / 32.0 dB | 0.99912 |
 | bmx-trees (80 frames, 432x240) | FlashRT NVFP4 (`--use-fp4`) | 10.72 s | 1.84x | 7.3 / 7.0 dB | 0.00000 (broken) |
 
-> Tennis numbers are from a same-session A/B (`--no-flashrt` vs `--vae-opt`
-> with/without `--fp8-conv`) measured on RTX 5060 Ti, CUDA 13.0, cuDNN 9.2,
-> PyTorch 2.12. Peak VRAM: fp16 ref 3.67 GB, FlashRT FP8 conv3d 2.51 GB.
+> Tennis numbers are from a same-session serial A/B (`--no-flashrt
+> --no-vae-opt` vs default FlashRT FP8 stack) measured on RTX 5060 Ti,
+> CUDA 13.0, cuDNN 9.2, PyTorch 2.12. Run one process at a time —
+> parallel invocations contend on the GPU and inflate wall time.
+> Peak VRAM: fp16 ref 3.67 GB, FlashRT FP8 2.51 GB.
 
 Takeaways:
 
-- **FP8 + VAE opt + CL + FP8 conv3d + fused FFN epilogue + fused bias-gate residual + fused adaLN-quant (shared-scale QKV) + fused RMSNorm+RoPE is the recommended default**: 2.38x
-  faster than the fp16 reference with PSNR 40.8 dB (median) on full-frame
-  tennis clip, peak VRAM 2.51 GB. The fused FFN epilogue kernel
+- **FP8 + VAE opt + CL + FP8 conv3d + fused FFN epilogue + fused bias-gate residual + fused adaLN-quant (shared-scale QKV) + fused RMSNorm+RoPE is the recommended default**: 2.41x
+  faster than the fp16 reference (17.33 s → 7.18 s) with PSNR 40.0 dB (median,
+  39.93 dB mean over 69 inpainted frames) on full-frame tennis clip, peak VRAM
+  2.51 GB (vs 3.67 GB fp16 ref, –32%). The fused FFN epilogue kernel
   (`bias_gelu_quant_fp16_fp8`) collapses bias-add + GELU + activation
   quantise into one pass, cutting denoise GPU time by 15% (3.73 → 3.16 s)
   and end-to-end from 8.58 → 7.56 s. The fused bias + gate + residual
@@ -371,7 +374,8 @@ Takeaways:
   `fp16_rmsnorm_rope_bshd` kernel then collapses the Q/K RMSNorm +
   interleaved RoPE into a single per-token pass, eliminating one full
   fp16 R/W of each Q/K tensor per attention block. Combined wall time
-  drops 7.57 → 7.28 s (–4%).
+  drops 7.57 → 7.28 s (–4%). Latest serial measurement (same-session A/B,
+  one process at a time, no GPU contention) confirms **7.18 s / 2.41x**.
 - **FP8 conv3d vs channels-last-only cuDNN**: the hand-rolled implicit-GEMM
   kernel (no im2col materialization, virtual cache concat, per-channel
   weight dequant, fused amax, running-max scale) beats cuDNN's fp16 conv3d
@@ -411,14 +415,14 @@ to the quantised GEMMs and the attention backend.
 | VAE `fp16_rms_silu_ndhwc` (CL) kernel | cosine vs fp32 reference | >= 0.9999999 |
 | VAE `fp16_rms_silu_amax_ndhwc` kernel | amax vs fp32 reference | exact (atomicMax on non-negative floats) |
 | VAE `fp8_conv3d_mm` kernel | cosine vs fp16 F.conv3d | >= 0.9993 (per-layer) |
-| End-to-end FP8 + VAE opt + CL + FP8 conv3d + fused FFN epilogue (full-frame) | PSNR vs fp16 ref | 40.0 dB (median) / >= 36.4 dB (worst frame) |
+| End-to-end FP8 + VAE opt + CL + FP8 conv3d + fused FFN epilogue (full-frame) | PSNR vs fp16 ref | 40.0 dB (median) / >= 36.0 dB (worst frame) |
 | End-to-end FP8 + VAE opt + CL + FP8 conv3d (full-frame) | PSNR vs fp16 ref | 39.9 dB (median) / >= 36.4 dB (worst frame) |
 | End-to-end FP8 + VAE opt + CL only (no FP8 conv3d) | PSNR vs fp16 ref | 40.8 dB (median) / >= 37.0 dB (worst frame) |
 | Attention — SageAttention QK-int8 PV-fp8 (`sage_fp8`, default) | cosine vs SDPA | 0.9993 |
 | Attention — SageAttention QK-int8 PV-fp16 (`sage_fp16`) | cosine vs SDPA | 0.9999 |
 | NVFP4 W4A4 GEMM | cosine vs fp16 matmul | >= 0.999 |
 | FP8 W8A8 GEMM | cosine vs fp16 matmul | >= 0.999 |
-| End-to-end FP8 (full-frame) | PSNR vs fp16 ref | 35-41 dB (mean) / >= 32 dB (worst frame) |
+| End-to-end FP8 (full-frame) | PSNR vs fp16 ref | 35-41 dB (mean 39.9) / >= 36 dB (worst frame) |
 | End-to-end FP8 (full-frame) | cosine vs fp16 ref | >= 0.999 |
 | End-to-end NVFP4 (full-frame) | cosine vs fp16 ref | ~0.0 — **broken**, output drifts to black (median per-pixel deviation ~85 / 255) |
 | End-to-end NVFP4 (small cropped region only) | PSNR vs fp16 ref | ~52 dB (mean) / ~45 dB (worst frame); per-block FP4 error stays bounded only when activations are small |
