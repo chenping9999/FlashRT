@@ -23,6 +23,7 @@
 #include "kernels/minimax_remover/fp16_bias_gate_residual.cuh"
 #include "kernels/minimax_remover/fp16_ada_layernorm_quant_fp8.cuh"
 #include "kernels/minimax_remover/fp16_rmsnorm_rope.cuh"
+#include "kernels/minimax_remover/fp16_rmsnorm_rope_quant_int8.cuh"
 
 namespace py = pybind11;
 
@@ -382,4 +383,57 @@ PYBIND11_MODULE(flash_rt_minimax_remover, m) {
         "Replaces the 2-kernel rms_norm_fp32stat + rope_apply_bshd Triton "
         "sequence with one pass — eliminates one full fp16 read+write of "
         "the Q/K tensor.  Dd must be a multiple of 8.");
+
+    // ── Fused RMSNorm + RoPE + int8 quantize (Q, per-warp) ──────────
+    m.def("fp16_rmsnorm_rope_quant_int8_q",
+        [](uintptr_t x_fp16, uintptr_t weight_fp16,
+           uintptr_t cos_fp32, uintptr_t sin_fp32,
+           uintptr_t out_int8, uintptr_t scale_fp32,
+           int B, int S, int H, int Dd,
+           float eps, float sm_scale, uintptr_t stream) {
+            return flash_rt::kernels::minimax_remover::
+                fp16_rmsnorm_rope_quant_int8_q(
+                to_ptr(x_fp16), to_ptr(weight_fp16),
+                to_ptr(cos_fp32), to_ptr(sin_fp32),
+                to_ptr(out_int8), to_ptr(scale_fp32),
+                B, S, H, Dd, eps, sm_scale, to_stream(stream));
+        },
+        py::arg("x_fp16"), py::arg("weight_fp16"),
+        py::arg("cos_fp32"), py::arg("sin_fp32"),
+        py::arg("out_int8"), py::arg("scale_fp32"),
+        py::arg("B"), py::arg("S"), py::arg("H"), py::arg("Dd"),
+        py::arg("eps") = 1e-6f, py::arg("sm_scale") = 1.0f,
+        py::arg("stream") = 0,
+        "Fused RMSNorm + RoPE + per-warp int8 quantization for Q. "
+        "Eliminates the fp16 intermediate between norm+rope and quantize. "
+        "Output: int8 [B*S, H*Dd], scale [B, H, ceil(S/32)]. "
+        "sm_scale is folded into quantization (softmax scale pre-multiply).");
+
+    // ── Fused RMSNorm + RoPE + int8 quantize (K, per-block + smooth_k) ─
+    m.def("fp16_rmsnorm_rope_quant_int8_k",
+        [](uintptr_t x_fp16, uintptr_t weight_fp16,
+           uintptr_t cos_fp32, uintptr_t sin_fp32,
+           uintptr_t km_fp16,
+           uintptr_t out_int8, uintptr_t scale_fp32,
+           int B, int S, int H, int Dd,
+           float eps, float sm_scale, uintptr_t stream) {
+            return flash_rt::kernels::minimax_remover::
+                fp16_rmsnorm_rope_quant_int8_k(
+                to_ptr(x_fp16), to_ptr(weight_fp16),
+                to_ptr(cos_fp32), to_ptr(sin_fp32),
+                to_ptr(km_fp16),
+                to_ptr(out_int8), to_ptr(scale_fp32),
+                B, S, H, Dd, eps, sm_scale, to_stream(stream));
+        },
+        py::arg("x_fp16"), py::arg("weight_fp16"),
+        py::arg("cos_fp32"), py::arg("sin_fp32"),
+        py::arg("km_fp16"),
+        py::arg("out_int8"), py::arg("scale_fp32"),
+        py::arg("B"), py::arg("S"), py::arg("H"), py::arg("Dd"),
+        py::arg("eps") = 1e-6f, py::arg("sm_scale") = 1.0f,
+        py::arg("stream") = 0,
+        "Fused RMSNorm + RoPE + per-block int8 quantization for K with "
+        "smooth_k (subtract key mean). Eliminates fp16 intermediate. "
+        "Output: int8 [B*S, H*Dd], scale [B, H, ceil(S/64)]. "
+        "km_fp16 can be 0 (nullptr) to skip smooth_k.");
 }
