@@ -24,6 +24,8 @@
 #include "kernels/minimax_remover/fp16_ada_layernorm_quant_fp8.cuh"
 #include "kernels/minimax_remover/fp16_rmsnorm_rope.cuh"
 #include "kernels/minimax_remover/fp16_rmsnorm_rope_quant_int8.cuh"
+#include "kernels/minimax_remover/fp16_quant_nvfp4_ndhwc.cuh"
+#include "kernels/minimax_remover/nvfp4_conv3d_ndhwc_fp16out.cuh"
 
 namespace py = pybind11;
 
@@ -436,4 +438,97 @@ PYBIND11_MODULE(flash_rt_minimax_remover, m) {
         "smooth_k (subtract key mean). Eliminates fp16 intermediate. "
         "Output: int8 [B*S, H*Dd], scale [B, H, ceil(S/64)]. "
         "km_fp16 can be 0 (nullptr) to skip smooth_k.");
+
+    // ── NVFP4 fused quantization kernels (WanVAE FP4 path) ──
+
+    m.def("fp16_rms_silu_quant_nvfp4_ndhwc",
+        [](uintptr_t x_fp16, uintptr_t gamma_fp16, uintptr_t bias_fp16,
+           uintptr_t y_fp4, uintptr_t y_sf,
+           int B, int C, int T, int H, int W,
+           float eps, uintptr_t stream) {
+            return flash_rt::kernels::minimax_remover::
+                fp16_rms_silu_quant_nvfp4_ndhwc(
+                to_ptr(x_fp16), to_ptr(gamma_fp16),
+                bias_fp16 ? to_ptr(bias_fp16) : nullptr,
+                to_ptr(y_fp4), to_ptr(y_sf),
+                B, C, T, H, W, eps, to_stream(stream));
+        },
+        py::arg("x_fp16"), py::arg("gamma_fp16"), py::arg("bias_fp16"),
+        py::arg("y_fp4"), py::arg("y_sf"),
+        py::arg("B"), py::arg("C"), py::arg("T"), py::arg("H"), py::arg("W"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "Fused fp16 NCDHW → RMS_norm + SiLU + NVFP4 quant (NDHWC out). "
+        "Output: fp4 [B,T,H,W,C/2] uint8, sf [B,T,H,W,C/16] uint8 UE4M3. "
+        "Requires C%96==0 (WanVAE channels 96/192/384). "
+        "Eliminates 3 separate passes into one kernel.");
+
+    m.def("fp16_quant_nvfp4_ndhwc",
+        [](uintptr_t x_fp16, uintptr_t y_fp4, uintptr_t y_sf,
+           int B, int C, int T, int H, int W, uintptr_t stream) {
+            return flash_rt::kernels::minimax_remover::fp16_quant_nvfp4_ndhwc(
+                to_ptr(x_fp16), to_ptr(y_fp4), to_ptr(y_sf),
+                B, C, T, H, W, to_stream(stream));
+        },
+        py::arg("x_fp16"), py::arg("y_fp4"), py::arg("y_sf"),
+        py::arg("B"), py::arg("C"), py::arg("T"), py::arg("H"), py::arg("W"),
+        py::arg("stream") = 0,
+        "Plain fp16 NCDHW → NVFP4 quant (NDHWC out), no norm/silu. "
+        "Used for causal-conv cache quantization.");
+
+    m.def("fp16_quant_nvfp4_cl_ndhwc",
+        [](uintptr_t x_fp16, uintptr_t y_fp4, uintptr_t y_sf,
+           int B, int C, int T, int H, int W, uintptr_t stream) {
+            return flash_rt::kernels::minimax_remover::fp16_quant_nvfp4_cl_ndhwc(
+                to_ptr(x_fp16), to_ptr(y_fp4), to_ptr(y_sf),
+                B, C, T, H, W, to_stream(stream));
+        },
+        py::arg("x_fp16"), py::arg("y_fp4"), py::arg("y_sf"),
+        py::arg("B"), py::arg("C"), py::arg("T"), py::arg("H"), py::arg("W"),
+        py::arg("stream") = 0,
+        "fp16 channels-last 3D → NVFP4 quant (NDHWC out). "
+        "Eliminates contiguous() copy for channels-last inputs.");
+
+    m.def("fp16_rms_silu_quant_nvfp4_cl_ndhwc",
+        [](uintptr_t x_fp16, uintptr_t gamma_fp16, uintptr_t bias_fp16,
+           uintptr_t y_fp4, uintptr_t y_sf,
+           int B, int C, int T, int H, int W,
+           float eps, uintptr_t stream) {
+            return flash_rt::kernels::minimax_remover::
+                fp16_rms_silu_quant_nvfp4_cl_ndhwc(
+                to_ptr(x_fp16), to_ptr(gamma_fp16),
+                bias_fp16 ? to_ptr(bias_fp16) : nullptr,
+                to_ptr(y_fp4), to_ptr(y_sf),
+                B, C, T, H, W, eps, to_stream(stream));
+        },
+        py::arg("x_fp16"), py::arg("gamma_fp16"), py::arg("bias_fp16"),
+        py::arg("y_fp4"), py::arg("y_sf"),
+        py::arg("B"), py::arg("C"), py::arg("T"), py::arg("H"), py::arg("W"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "Fused fp16 channels-last → RMS_norm + SiLU + NVFP4 quant (NDHWC out).");
+
+    // ── WanVAE NVFP4 conv3d (purpose-built, fp16 NDHWC output) ──
+
+    m.def("nvfp4_conv3d_ndhwc_fp16out",
+        [](uintptr_t cache_x_fp4, uintptr_t new_x_fp4, uintptr_t w_fp4,
+           uintptr_t cache_sfa, uintptr_t new_sfa, uintptr_t w_sfb,
+           uintptr_t y_fp16, uintptr_t bias_fp16,
+           int N, int T_cache, int T_new, int H, int W, int Ci, int Co,
+           float alpha, uintptr_t stream) {
+            return flash_rt::kernels::minimax_remover::
+                nvfp4_conv3d_ndhwc_fp16out(
+                to_ptr(cache_x_fp4), to_ptr(new_x_fp4), to_ptr(w_fp4),
+                to_ptr(cache_sfa), to_ptr(new_sfa), to_ptr(w_sfb),
+                to_ptr(y_fp16),
+                bias_fp16 ? to_ptr(bias_fp16) : nullptr,
+                N, T_cache, T_new, H, W, Ci, Co, alpha, to_stream(stream));
+        },
+        py::arg("cache_x_fp4"), py::arg("new_x_fp4"), py::arg("w_fp4"),
+        py::arg("cache_sfa"), py::arg("new_sfa"), py::arg("w_sfb"),
+        py::arg("y_fp16"), py::arg("bias_fp16"),
+        py::arg("N"), py::arg("T_cache"), py::arg("T_new"),
+        py::arg("H"), py::arg("W"), py::arg("Ci"), py::arg("Co"),
+        py::arg("alpha") = 1.0f, py::arg("stream") = 0,
+        "WanVAE NVFP4 W4A4 conv3d (3x3x3 causal, fp16 NDHWC output). "
+        "Purpose-built: eliminates bf16→fp16 + NCDHW→NDHWC conversions. "
+        "Requires Ci%64==0, T_cache==2.");
 }

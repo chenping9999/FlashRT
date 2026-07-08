@@ -605,6 +605,10 @@ def parse_args() -> argparse.Namespace:
                    help="Use FP8 implicit-GEMM conv3d kernel for applicable "
                         "3x3x3 causal convs (requires --vae-opt). Trades ~1.5 "
                         "dB PSNR for ~13%% decode speedup. (default: enabled)")
+    p.add_argument("--no-nvfp4-vae", action="store_true",
+                   help="Disable NVFP4 W4A4 VAE conv3d (default: enabled). "
+                        "Uses purpose-built NVFP4 MMA kernel for eligible "
+                        "decode conv layers (Ci>=192) for ~3-7%% VAE speedup.")
     return p.parse_args()
 
 
@@ -664,6 +668,13 @@ def main() -> None:
         stats = install_vae_optimizations(pipe.vae,
                                            use_fp8_conv=args.fp8_conv)
         print(f"  VAE optimised: {stats}")
+
+    # NVFP4 VAE conv3d (default ON for FlashRT FP8 path; --no-nvfp4-vae to disable)
+    if args.vae_opt and not args.no_flashrt and not args.use_fp4 and not args.no_nvfp4_vae:
+        from flash_rt.models.minimax_remover._vae_nvfp4 import install_vae_nvfp4
+        nvfp4_stats = install_vae_nvfp4(pipe.vae)
+        if nvfp4_stats.get('enabled'):
+            print(f"  NVFP4 VAE: {nvfp4_stats.get('n_quantized', 0)} layers → W4A4")
 
     if args.no_flashrt:
         runner = pipe

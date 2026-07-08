@@ -7,7 +7,8 @@ kernelized inference on Blackwell SM120. Two precision paths ship under
 | Entrypoint | Precision | Recommended use |
 |------------|-----------|-----------------|
 | `MiniMaxRemoverPipelineFP8` | FP8 (W8A8) | **Default.** Full-frame inpainting; end-to-end cosine >= 0.999, PSNR ~35-41 dB vs fp16 (see Performance). |
-| `MiniMaxRemoverPipeline` | NVFP4 (W4A4) | Cropped small regions only. Full-frame large latents drift/blacken due to FP4 error accumulation. |
+| `MiniMaxRemoverPipelineFP8` + NVFP4 VAE | FP8 transformer + NVFP4 VAE (W4A4) | **Default (enabled automatically).** Purpose-built NVFP4 conv3d kernel accelerates the VAE encode/decode by ~16%; PSNR ~35 dB vs fp16 (see Performance). |
+| `MiniMaxRemoverPipeline` | NVFP4 (W4A4) transformer | Cropped small regions only. Full-frame large latents drift/blacken due to FP4 error accumulation in the transformer denoise loop. |
 
 Both reuse the **generic** FlashRT kernels for the transformer denoise path
 (quantized GEMMs, fused norm/gate/residual/gelu ops, kernel attention via
@@ -18,10 +19,19 @@ FA2 / SageAttention). The VAE encode/decode is additionally accelerated by
 `fp16_rms_silu_ncdhw` (fused RMSNorm + SiLU), and their channels-last
 (NDHWC) variants `fp16_rms_norm_ndhwc` / `fp16_rms_silu_ndhwc` which
 keep the entire VAE pipeline in channels-last 3D memory format —
-eliminating cuDNN's per-conv `nchw↔nhwc` conversion kernels. The NVFP4 path additionally
-captures the N-step flow-matching loop as a single CUDA Graph; the FP8 path
-is graph-compatible (stable static scales, no host sync in steady state) but
-does not itself capture a graph.
+eliminating cuDNN's per-conv `nchw↔nhwc` conversion kernels. The FP8 transformer
+path is graph-compatible (stable static scales, no host sync in steady state)
+but does not itself capture a graph. The NVFP4 transformer path additionally
+captures the N-step flow-matching loop as a single CUDA Graph.
+
+On top of the FP8 transformer path, the **NVFP4 VAE** optimization
+(`install_vae_nvfp4`) replaces eligible 3×3×3 conv3d layers in the WanVAE
+with a **purpose-built NVFP4 W4A4 conv3d kernel** (`nvfp4_conv3d_ndhwc_fp16out`)
+that uses the SM120 `mma.sync.kind::mxf4nvf4` FP4 MMA for 2× tensor-core
+throughput. Unlike the NVFP4 transformer path (which is broken on full-frame
+latents), the NVFP4 VAE path works correctly on full-frame inputs because
+the VAE is a single-pass encoder/decoder (no iterative error accumulation).
+A rolling 2-frame FP4 cache eliminates per-call cache re-quantization.
 
 ## Build
 
@@ -76,6 +86,11 @@ cmake --build build -j --target flash_rt_minimax_remover
 | channels-last pipeline | Python (`_vae_opt.py`) | Conv3d weight → CL, WanCausalConv3d → CL-preserving forward | eliminates ~97% of nchw↔nhwc conversion kernels (~280 ms / decode) |
 | Running-max amax | Python (`_vae_opt.py`) | separate `amax_fp16` calls over cache + new each iteration | norm fuses amax via atomicMax into a persistent buffer shared with the sister conv; cache amax is skipped entirely (covered by running max) |
 | `WanUpsample` patch | Python (no kernel) | `x.float().type_as(x)` for nearest-exact upsample | eliminates redundant fp32 cast (index-only op, fp16 == fp32) |
+| `nvfp4_conv3d_ndhwc_fp16out` | `flash_rt_minimax_remover` | FP8 conv3d for eligible 3×3×3 causal convs (Ci % 64 == 0) | **Purpose-built NVFP4 W4A4** implicit-GEMM conv3d using `mma.sync.kind::mxf4nvf4` (e2m1×e2m1, UE4M3 block scales). fp16 NDHWC output (eliminates bf16→fp16 + NCDHW→NDHWC conversions). 2× MMA throughput vs FP8. ~16% VAE speedup. |
+| `fp16_quant_nvfp4_ndhwc` | `flash_rt_minimax_remover` | PyTorch multi-pass fp16→FP8 quant for VAE activations | Fused fp16 NCDHW → NVFP4 packed + UE4M3 block-scale (NDHWC output). Single-pass quantization with per-16-element block scales. |
+| `fp16_quant_nvfp4_cl_ndhwc` | `flash_rt_minimax_remover` | same, for channels-last 3D input | Channels-last variant: reads NDHWC physical layout directly (channel is innermost → coalesced). Eliminates `contiguous()` copy. |
+| `fp16_rms_silu_quant_nvfp4_cl_ndhwc` | `flash_rt_minimax_remover` | separate RMS+SiLU + fp16→FP4 quant (3 kernels) | Fused RMS_norm + SiLU + NVFP4 quantization in one kernel (channels-last input). fp32 statistics, fp32 SiLU (preserves fp16 mantissa precision). |
+| Rolling 2-frame FP4 cache | Python (`_vae_nvfp4.py`) | per-call cache fp16→FP4 quantization | Stores quantized FP4+SF from the previous call; rolling 2-frame window handles T_new=1 (decode) by combining `[prev_frame, current_frame]`. Eliminates cache quantization per call. |
 
 The VAE stays fp16 at the interface. Norm/activation ops use fp16-native
 kernels (zero precision loss). Applicable 3×3×3 causal conv3d layers
@@ -342,10 +357,11 @@ All rows compare against the non-FlashRT `--no-flashrt` fp16 reference on the
 | tennis (70 frames, 432x240) | FlashRT FP8 + VAE opt + CL + FP8 conv3d + fused FFN epilogue | 7.56 s | 2.29x | 40.0 / 36.4 dB | 0.99981 |
 | tennis (70 frames, 432x240) | FlashRT FP8 + VAE opt + CL + FP8 conv3d + fused FFN epilogue + fused bias-gate residual | 7.57 s | 2.30x | 40.0 / 36.2 dB | 0.99981 |
 | tennis (70 frames, 432x240) | **… + fused adaLN+quant (shared-scale QKV) + fused RMSNorm+RoPE + fused norm2+quant (default)** | **7.18 s** | **2.41x** | **40.0 / 36.0 dB** | 0.99981 |
-| tennis (70 frames, 432x240) | FlashRT NVFP4 (`--use-fp4`) | 9.52 s | 1.82x | 7.0 / 6.2 dB | 0.00000 (broken) |
+| tennis (70 frames, 432x240) | **… + NVFP4 VAE (38 conv layers → W4A4, FP4 cache)** | **6.71 s** | **2.58x** | **34.7 / 30.6 dB** | 0.99981 |
+| tennis (70 frames, 432x240) | FlashRT NVFP4 transformer (`--use-fp4`) | 9.52 s | 1.82x | 7.0 / 6.2 dB | 0.00000 (broken — transformer FP4 error accumulates over 12 denoise steps) |
 | bmx-trees (80 frames, 432x240) | fp16 reference (`--no-flashrt`) | 19.76 s | 1.0x | — | — |
 | bmx-trees (80 frames, 432x240) | FlashRT FP8 (default) | 13.24 s | **1.49x** | 35.1 / 32.0 dB | 0.99912 |
-| bmx-trees (80 frames, 432x240) | FlashRT NVFP4 (`--use-fp4`) | 10.72 s | 1.84x | 7.3 / 7.0 dB | 0.00000 (broken) |
+| bmx-trees (80 frames, 432x240) | FlashRT NVFP4 transformer (`--use-fp4`) | 10.72 s | 1.84x | 7.3 / 7.0 dB | 0.00000 (broken — transformer FP4 error accumulates over 12 denoise steps) |
 
 > Tennis numbers are from a same-session serial A/B (`--no-flashrt
 > --no-vae-opt` vs default FlashRT FP8 stack) measured on RTX 5060 Ti,
@@ -381,12 +397,23 @@ Takeaways:
   weight dequant, fused amax, running-max scale) beats cuDNN's fp16 conv3d
   while staying in fp16 at the interface. Disable with `--no-fp8-conv` to
   recover ~1 dB PSNR if absolute precision is preferred over speed.
-- **NVFP4 is faster but unusable on full-frame latents**: cosine collapses to
+- **NVFP4 VAE (default ON)**: the purpose-built `nvfp4_conv3d_ndhwc_fp16out`
+  kernel replaces 38 eligible 3×3×3 conv3d layers (Ci ≥ 192) in the WanVAE
+  with NVFP4 W4A4 MMA (`mma.sync.kind::mxf4nvf4`, 2× tensor-core throughput
+  vs FP8). Key optimizations: (1) fp16 NDHWC output — eliminates bf16→fp16 +
+  NCDHW→NDHWC conversions; (2) channels-last direct input — eliminates
+  `contiguous()` copy; (3) rolling 2-frame FP4 cache — eliminates per-call
+  cache re-quantization. VAE encode 14.5% faster, decode 13.6% faster
+  (VAE total 3493→3002 ms, –16.4%). End-to-end 7.18→6.71 s (**2.58× vs fp16
+  reference**). PSNR 34.7 dB (median) vs fp16 — «近乎一致（优秀）». Disable
+  with `--no-nvfp4-vae`.
+- **NVFP4 transformer (`--use-fp4`) is unusable on full-frame latents**: cosine collapses to
   ~0.0 and PSNR to ~7 dB (median per-pixel deviation ~85/255). The FP4
-  quantisation error accumulates over the large full-frame activations and the
-  output drifts to black — exactly why FP8 is the default. NVFP4 is only
-  appropriate for small cropped regions, where its per-block error stays
-  bounded.
+  quantisation error accumulates over the 12-step denoise loop in the transformer
+  and the output drifts to black. NVFP4 transformer is only appropriate for
+  small cropped regions, where its per-block error stays bounded. The NVFP4
+  **VAE** path (above) is unaffected because the VAE is a single-pass
+  encoder/decoder with no iterative error accumulation.
 
 ### Transformer GEMM (NVFP4 vs fp16 matmul, single layer)
 
@@ -423,8 +450,10 @@ to the quantised GEMMs and the attention backend.
 | NVFP4 W4A4 GEMM | cosine vs fp16 matmul | >= 0.999 |
 | FP8 W8A8 GEMM | cosine vs fp16 matmul | >= 0.999 |
 | End-to-end FP8 (full-frame) | PSNR vs fp16 ref | 35-41 dB (mean 39.9) / >= 36 dB (worst frame) |
+| End-to-end FP8 + NVFP4 VAE (full-frame) | PSNR vs fp16 ref | 34.7 dB (median) / >= 30.6 dB (worst frame) |
+| End-to-end FP8 + NVFP4 VAE (full-frame) | PSNR vs FP8 baseline | 34.3 dB (median) / >= 31.0 dB (worst frame) |
 | End-to-end FP8 (full-frame) | cosine vs fp16 ref | >= 0.999 |
-| End-to-end NVFP4 (full-frame) | cosine vs fp16 ref | ~0.0 — **broken**, output drifts to black (median per-pixel deviation ~85 / 255) |
+| End-to-end NVFP4 transformer (full-frame) | cosine vs fp16 ref | ~0.0 — **broken**, output drifts to black (FP4 error accumulates over 12 denoise steps in the transformer) |
 | End-to-end NVFP4 (small cropped region only) | PSNR vs fp16 ref | ~52 dB (mean) / ~45 dB (worst frame); per-block FP4 error stays bounded only when activations are small |
 
 The default `sage_fp8` attention gives the best latency at cosine 0.9993;
@@ -438,7 +467,8 @@ the steady state; the FP8 path calibrates on the first call then freezes.
 |------|---------|--------|
 | `--vae-opt` / `--no-vae-opt` | **enabled** | Install FlashRT fp16 fused VAE kernels (`fp16_rms_norm_ncdhw`, `fp16_rms_silu_ncdhw`, NDHWC variants, fused norm+silu+amax) + channels-last 3D pipeline + running-max amax sharing between norm and conv + FP8 implicit-GEMM conv3d + `WanUpsample` cast elimination. Requires the `flash_rt_minimax_remover` module. |
 | `--fp8-conv` / `--no-fp8-conv` | **enabled** | Use FP8 implicit-GEMM conv3d kernel for applicable 3×3×3 causal convs (requires `--vae-opt`). Trades ~1 dB PSNR for ~14% decode speedup over channels-last-only cuDNN. |
-| `--use-fp4` | off | Use NVFP4 (W4A4) instead of the default FP8 (W8A8). Small-region only. |
+| `--use-fp4` | off | Use NVFP4 (W4A4) transformer instead of FP8 (W8A8). Small-region only — broken on full-frame. |
+| `--no-nvfp4-vae` | off | Disable NVFP4 W4A4 VAE conv3d (default: enabled). Uses purpose-built NVFP4 MMA kernel for eligible VAE conv layers (Ci>=192) for ~16% VAE speedup. |
 | `--no-flashrt` | off | Run the reference diffusers fp16 path (no FlashRT). |
 
 ## Environment variables
@@ -453,6 +483,11 @@ the steady state; the FP8 path calibrates on the first call then freezes.
 | `FLASHRT_FP8_TARGET` | `all` | FP8 Linear scope (`all` / `ffn_only`) (FP8 path) |
 | `FLASHRT_NORM_MODE` | `triton` | per-block LayerNorm kernel: `triton` (fp32-stat Triton, bit-exact) / `fp16` (FlashRT `ada_layer_norm_fp16`, lower precision, debug only) |
 | `FLASHRT_GELU_MODE` | `inplace` | FFN GELU kernel: `inplace` (FlashRT fused `gelu_inplace*`) / `torch` (original `F.gelu`, debug only) |
+| `FLASHRT_NVFP4_VAE` | `1` | Enable NVFP4 VAE conv3d (default ON). Set to `0` to disable. |
+| `FLASHRT_NVFP4_VAE_DECODE_ONLY` | `0` | `1` = apply NVFP4 only to decoder (encoder stays FP8); `0` = both encode+decode. |
+| `FLASHRT_NVFP4_VAE_MIN_CI` | `192` | Minimum Ci for NVFP4 eligibility. 192 covers WanVAE Ci=192/384; 384 is stricter (better PSNR, fewer layers). |
+| `FLASHRT_NVFP4_NO_CACHE` | `0` | `1` = disable FP4 cache (re-quantize cache per call); `0` = use rolling 2-frame FP4 cache (default, faster). |
+| `FLASHRT_NVFP4_NO_FUSED_BLOCKS` | `1` | `1` = don't patch WanResidualBlock.forward for fused norm+quant (default ON — separate norm+quant is more precise); `0` = enable fused block forward (faster but ~2 dB PSNR drop). |
 
 ## Usage
 
@@ -475,7 +510,38 @@ output = pipeline(
 video = output.frames
 ```
 
-### NVFP4 (small cropped regions only)
+### FP8 + NVFP4 VAE (recommended default — full-frame, fastest)
+
+The NVFP4 VAE optimization is **enabled by default** when using the FP8
+transformer path with VAE optimizations. No extra code needed — just
+construct the FP8 pipeline and call `install_vae_optimizations` +
+`install_vae_nvfp4`:
+
+```python
+from flash_rt.models.minimax_remover import MiniMaxRemoverPipelineFP8
+from flash_rt.models.minimax_remover._vae_opt import install_vae_optimizations
+from flash_rt.models.minimax_remover._vae_nvfp4 import install_vae_nvfp4
+
+pipeline = MiniMaxRemoverPipelineFP8(pipe)
+install_vae_optimizations(pipe.vae, use_fp8_conv=True)
+install_vae_nvfp4(pipe.vae)  # 38 conv layers → NVFP4 W4A4 (default ON)
+
+output = pipeline(
+    images=frames, masks=masks, num_frames=len(frames),
+    height=720, width=1280, num_inference_steps=12,
+)
+```
+
+Or via the quickstart (NVFP4 VAE is on by default):
+
+```bash
+python3 examples/minimax_remover_quickstart.py \
+    --model-dir ./minimax-remover \
+    --frames-dir ./frames --masks-dir ./masks --output-dir ./out
+# Add --no-nvfp4-vae to disable
+```
+
+### NVFP4 transformer (small cropped regions only)
 
 ```python
 from flash_rt.models.minimax_remover import MiniMaxRemoverPipeline
