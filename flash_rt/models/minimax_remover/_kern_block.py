@@ -114,6 +114,12 @@ def install_fused_blocks(transformer, norm_mode=None, gelu_mode=None):
                      and hasattr(_fvk, "fp16_ada_layernorm_quant_fp8")
                      and os.environ.get("FLASHRT_DISABLE_ADA_QKV", "0") != "1")
 
+    # Fused norm2 + fp8 quantise — feeds FFN proj0 from fp8 directly,
+    # eliminating the intermediate fp16 [S,D] write + read + quantise.
+    _fuse_norm2_ffn = (_fvk is not None
+                       and hasattr(_fvk, "fp16_ada_layernorm_quant_fp8")
+                       and os.environ.get("FLASHRT_DISABLE_NORM2_FFN", "0") != "1")
+
     def _gate_residual_apply(hs, x_no_bias, bias, gate, S, D):
         """residual += (x + bias) * gate[D]  — one fused kernel if available,
         else falls back to add_bias_fp16 + gate_mul_residual_bcast."""
@@ -198,22 +204,8 @@ def install_fused_blocks(transformer, norm_mode=None, gelu_mode=None):
         else:
             gate_mul_residual_bcast(hs, attn_out, gate_msa.view(D))
 
-        if norm_mode == "fp16":
-            norm2_out = _ada_norm_flashrt_fp16(hs, c_scale_msa, c_shift_msa, S, D)
-        else:
-            norm2_out = _ada_norm(hs, c_scale_msa, c_shift_msa, S, D)
-        n2_3d = norm2_out.view(1, S, D)
-        if gelu_mode == "torch":
-            ff_out = self.ffn(n2_3d).view(S, D)
-            gate_mul_residual_bcast(hs, ff_out, c_gate_msa.view(D))
-            return hs.view(1, S, D)
-
         proj0 = self.ffn.net[0].proj
         proj1 = self.ffn.net[2]
-        # Fused FFN epilogue: bias + gelu + quant → fp8 in one kernel.
-        # Only when both Linears are FlashRT FP8, the kernel module is
-        # loaded, scales are frozen (not calibrating), and proj0 has a
-        # bias.  Saves 3 full-tensor fp16 round-trips per block.
         _can_fuse = (
             _fvk is not None
             and hasattr(proj0, "gemm_no_bias")
@@ -221,32 +213,66 @@ def install_fused_blocks(transformer, norm_mode=None, gelu_mode=None):
             and not getattr(proj1, "calibrating", False)
             and getattr(proj0, "bias", None) is not None
             and (proj0.out_features & 3) == 0)
-        # Additional fusion of proj1 (FFN-down) bias into gate+residual:
-        # requires the pre-quantised fp8 input path plus gemm_no_bias_from_fp8.
         _fuse_ffn_down = (_has_bgr and _can_fuse
                           and hasattr(proj1, "gemm_no_bias_from_fp8")
                           and getattr(proj1, "bias", None) is not None
                           and (D & 7) == 0)
-        if _can_fuse:
-            raw = proj0.gemm_no_bias(n2_3d)        # quant+GEMM, no bias → fp16 [1,S,inner]
-            inner = raw.shape[-1]
-            up_fp8 = torch.empty(
-                S, inner, dtype=torch.float8_e4m3fn, device=raw.device)
-            _fvk.bias_gelu_quant_fp16_fp8(
-                raw.data_ptr(), proj0.bias.data_ptr(),
-                up_fp8.data_ptr(), proj1.act_scale.data_ptr(),
-                S, inner, stream_of())
-            if _fuse_ffn_down:
-                ff_out = proj1.gemm_no_bias_from_fp8(up_fp8).view(S, D)
-                _gate_residual_apply(hs, ff_out, proj1.bias, c_gate_msa, S, D)
-                return hs.view(1, S, D)
-            ff_out = proj1.forward_from_fp8(up_fp8).view(S, D)
+
+        _do_norm2_fp8 = (_fuse_norm2_ffn and _can_fuse
+                         and hasattr(proj0, "gemm_no_bias_from_fp8")
+                         and not getattr(proj0, "calibrating", False)
+                         and (D & 7) == 0)
+
+        if gelu_mode == "torch":
+            if norm_mode == "fp16":
+                norm2_out = _ada_norm_flashrt_fp16(hs, c_scale_msa, c_shift_msa, S, D)
+            else:
+                norm2_out = _ada_norm(hs, c_scale_msa, c_shift_msa, S, D)
+            ff_out = self.ffn(norm2_out.view(1, S, D)).view(S, D)
+            gate_mul_residual_bcast(hs, ff_out, c_gate_msa.view(D))
+            return hs.view(1, S, D)
+
+        if _do_norm2_fp8:
+            c_scale_f = c_scale_msa.contiguous().to(torch.float32).view(D)
+            c_shift_f = c_shift_msa.contiguous().to(torch.float32).view(D)
+            norm2_fp8 = torch.empty(S, D, dtype=torch.float8_e4m3fn,
+                                    device=hs.device)
+            _fvk.fp16_ada_layernorm_quant_fp8(
+                hs.data_ptr(), c_scale_f.data_ptr(), c_shift_f.data_ptr(),
+                proj0.act_scale.data_ptr(), norm2_fp8.data_ptr(),
+                S, D, eps, stream_of())
+            raw = proj0.gemm_no_bias_from_fp8(norm2_fp8)
+        elif _can_fuse:
+            if norm_mode == "fp16":
+                norm2_out = _ada_norm_flashrt_fp16(hs, c_scale_msa, c_shift_msa, S, D)
+            else:
+                norm2_out = _ada_norm(hs, c_scale_msa, c_shift_msa, S, D)
+            raw = proj0.gemm_no_bias(norm2_out.view(1, S, D))
         else:
-            up = proj0(n2_3d)
+            if norm_mode == "fp16":
+                norm2_out = _ada_norm_flashrt_fp16(hs, c_scale_msa, c_shift_msa, S, D)
+            else:
+                norm2_out = _ada_norm(hs, c_scale_msa, c_shift_msa, S, D)
+            up = proj0(norm2_out.view(1, S, D))
             inner = up.shape[-1]
             _gelu_fn = kern.gelu_inplace if up.dtype == torch.bfloat16 else kern.gelu_inplace_fp16
             _gelu_fn(up.data_ptr(), S * inner, stream_of())
             ff_out = proj1(up).view(S, D)
+            gate_mul_residual_bcast(hs, ff_out, c_gate_msa.view(D))
+            return hs.view(1, S, D)
+
+        inner = raw.shape[-1]
+        up_fp8 = torch.empty(
+            S, inner, dtype=torch.float8_e4m3fn, device=raw.device)
+        _fvk.bias_gelu_quant_fp16_fp8(
+            raw.data_ptr(), proj0.bias.data_ptr(),
+            up_fp8.data_ptr(), proj1.act_scale.data_ptr(),
+            S, inner, stream_of())
+        if _fuse_ffn_down:
+            ff_out = proj1.gemm_no_bias_from_fp8(up_fp8).view(S, D)
+            _gate_residual_apply(hs, ff_out, proj1.bias, c_gate_msa, S, D)
+            return hs.view(1, S, D)
+        ff_out = proj1.forward_from_fp8(up_fp8).view(S, D)
         gate_mul_residual_bcast(hs, ff_out, c_gate_msa.view(D))
         return hs.view(1, S, D)
 

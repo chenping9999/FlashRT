@@ -341,7 +341,7 @@ All rows compare against the non-FlashRT `--no-flashrt` fp16 reference on the
 | tennis (70 frames, 432x240) | FlashRT FP8 + VAE opt + CL + FP8 conv3d | 8.58 s | 2.02x | 39.9 / 36.4 dB | 0.99981 |
 | tennis (70 frames, 432x240) | FlashRT FP8 + VAE opt + CL + FP8 conv3d + fused FFN epilogue | 7.56 s | 2.29x | 40.0 / 36.4 dB | 0.99981 |
 | tennis (70 frames, 432x240) | FlashRT FP8 + VAE opt + CL + FP8 conv3d + fused FFN epilogue + fused bias-gate residual | 7.57 s | 2.30x | 40.0 / 36.2 dB | 0.99981 |
-| tennis (70 frames, 432x240) | **… + fused adaLN+quant (shared-scale QKV) + fused RMSNorm+RoPE (default)** | **7.28 s** | **2.38x** | **40.8 / 36.3 dB** | 0.99981 |
+| tennis (70 frames, 432x240) | **… + fused adaLN+quant (shared-scale QKV) + fused RMSNorm+RoPE + fused norm2+quant (default)** | **7.25 s** | **2.39x** | **40.9 / 36.4 dB** | 0.99981 |
 | tennis (70 frames, 432x240) | FlashRT NVFP4 (`--use-fp4`) | 9.52 s | 1.82x | 7.0 / 6.2 dB | 0.00000 (broken) |
 | bmx-trees (80 frames, 432x240) | fp16 reference (`--no-flashrt`) | 19.76 s | 1.0x | — | — |
 | bmx-trees (80 frames, 432x240) | FlashRT FP8 (default) | 13.24 s | **1.49x** | 35.1 / 32.0 dB | 0.99912 |

@@ -253,6 +253,27 @@ PYBIND11_MODULE(flash_rt_minimax_remover, m) {
         "(no write); pass 2 re-reads x and quantizes. Produces ONLY fp8 "
         "output + scale, no fp16 intermediate.");
 
+    m.def("fp16_rms_silu_amax_quant_fp8_ndhwc_nozero",
+        [](uintptr_t x_fp16, uintptr_t gamma_fp16, uintptr_t bias_fp16,
+           uintptr_t y_fp8, uintptr_t scale_out, uintptr_t amax_buf,
+           int B, int C, int T, int H, int W,
+           float eps, uintptr_t stream) {
+            return flash_rt::kernels::minimax_remover::
+                fp16_rms_silu_amax_quant_fp8_ndhwc_nozero(
+                to_ptr(x_fp16), to_ptr(gamma_fp16),
+                bias_fp16 ? to_ptr(bias_fp16) : nullptr,
+                to_ptr(y_fp8), to_ptr(scale_out), to_ptr(amax_buf),
+                B, C, T, H, W, eps, to_stream(stream));
+        },
+        py::arg("x_fp16"), py::arg("gamma_fp16"), py::arg("bias_fp16"),
+        py::arg("y_fp8"), py::arg("scale_out"), py::arg("amax_buf"),
+        py::arg("B"), py::arg("C"), py::arg("T"), py::arg("H"), py::arg("W"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "Same as fp16_rms_silu_amax_quant_fp8_ndhwc but does NOT zero "
+        "amax_buf before pass 1. For running-max mode: caller seeds "
+        "amax_buf with historical max; pass 1 accumulates current output; "
+        "pass 2 quantizes with max(historical, current).");
+
     // ── Fused FFN epilogue: bias + gelu + quant → fp8 (transformer) ──
     m.def("bias_gelu_quant_fp16_fp8",
         [](uintptr_t gemm_out, uintptr_t bias, uintptr_t out,

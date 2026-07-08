@@ -72,6 +72,21 @@ int fp16_rms_silu_amax_quant_fp8_ndhwc(
     float eps,
     cudaStream_t stream);
 
+// (3b) Same as (3) but does NOT zero amax_buf before pass 1.
+//      For running-max mode: caller seeds amax_buf with the historical
+//      running max; pass 1 atomicMax-accumulates the current output's
+//      amax; pass 2 quantizes with max(historical, current).
+int fp16_rms_silu_amax_quant_fp8_ndhwc_nozero(
+    const void* x_fp16,
+    const void* gamma_fp16,
+    const void* bias_fp16,
+    void* y_fp8,
+    void* scale_out,
+    void* amax_buf,
+    int B, int C, int T, int H, int W,
+    float eps,
+    cudaStream_t stream);
+
 }  // namespace minimax_remover
 }  // namespace kernels
 }  // namespace flash_rt

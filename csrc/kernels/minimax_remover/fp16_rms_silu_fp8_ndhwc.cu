@@ -225,6 +225,44 @@ int fp16_rms_silu_amax_quant_fp8_ndhwc(
     return (e == cudaSuccess) ? 0 : -3;
 }
 
+int fp16_rms_silu_amax_quant_fp8_ndhwc_nozero(
+    const void* x_fp16, const void* gamma_fp16, const void* bias_fp16,
+    void* y_fp8, void* scale_out, void* amax_buf,
+    int B, int C, int T, int H, int W,
+    float eps, cudaStream_t stream)
+{
+    if (B <= 0 || C <= 0 || T <= 0 || H <= 0 || W <= 0) return -1;
+    const long long total_spatial = (long long)B * T * H * W;
+    if (total_spatial <= 0 || total_spatial > (long long)INT32_MAX) return -4;
+
+    const unsigned n_blocks = (unsigned)((total_spatial + kWarpsPerBlock - 1)
+                                         / kWarpsPerBlock);
+
+    fused_rms_silu_kernel<false, true, false><<<n_blocks, kThreads, 0, stream>>>(
+        reinterpret_cast<const __half*>(x_fp16),
+        reinterpret_cast<const __half*>(gamma_fp16),
+        bias_fp16 ? reinterpret_cast<const __half*>(bias_fp16) : nullptr,
+        nullptr,
+        nullptr,
+        reinterpret_cast<float*>(amax_buf),
+        nullptr, nullptr,
+        B, C, T, H, W, (int)total_spatial, eps);
+
+    fused_rms_silu_kernel<false, false, true><<<n_blocks, kThreads, 0, stream>>>(
+        reinterpret_cast<const __half*>(x_fp16),
+        reinterpret_cast<const __half*>(gamma_fp16),
+        bias_fp16 ? reinterpret_cast<const __half*>(bias_fp16) : nullptr,
+        nullptr,
+        reinterpret_cast<__nv_fp8_e4m3*>(y_fp8),
+        nullptr,
+        reinterpret_cast<const float*>(amax_buf),
+        reinterpret_cast<float*>(scale_out),
+        B, C, T, H, W, (int)total_spatial, eps);
+
+    cudaError_t e = cudaGetLastError();
+    return (e == cudaSuccess) ? 0 : -3;
+}
+
 }  // namespace minimax_remover
 }  // namespace kernels
 }  // namespace flash_rt
