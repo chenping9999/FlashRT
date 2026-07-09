@@ -317,6 +317,31 @@ class FlashRTFp8Linear(nn.Module):
                                    m, n, stream)
         return out.view(*orig_shape[:-1], n)
 
+    def gemm_from_fp8_ext_nobias(self, x_fp8: torch.Tensor,
+                                 ext_act_scale: torch.Tensor) -> torch.Tensor:
+        """Same as gemm_from_fp8_ext but WITHOUT the bias-add.
+
+        For the fully-fused attention path where the Q/K bias is added
+        inside the downstream ``fp16_rmsnorm_rope_bias_quant_int8`` kernel
+        (fused pre-norm) -- avoids the separate ``add_bias_vec8`` kernel
+        and its fp16 output round-trip.
+        """
+        if self.calibrating:
+            raise RuntimeError("gemm_from_fp8_ext_nobias is only valid post-calibration")
+        orig_shape = x_fp8.shape
+        x2d = x_fp8.reshape(-1, self.in_features)
+        if x2d.stride(0) != self.in_features or x2d.stride(1) != 1:
+            x2d = x2d.contiguous()
+        m = x2d.shape[0]
+        k, n = self.in_features, self.out_features
+        stream = torch.cuda.current_stream().cuda_stream
+        out = torch.empty(m, n, dtype=torch.float16, device=x2d.device)
+        kern.fp8_gemm_descale_fp16(
+            x2d.data_ptr(), self.weight_fp8.data_ptr(), out.data_ptr(),
+            m, n, k, ext_act_scale.data_ptr(),
+            self.weight_scale.data_ptr(), stream)
+        return out.view(*orig_shape[:-1], n)
+
 
 def _is_fp8_target(module: nn.Module) -> bool:
     """Determine whether a Linear is suitable for FP8 replacement.

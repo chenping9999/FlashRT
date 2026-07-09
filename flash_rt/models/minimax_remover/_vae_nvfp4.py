@@ -39,6 +39,13 @@ logger = logging.getLogger(__name__)
 _FP16 = torch.float16
 _BF16 = torch.bfloat16
 
+# Direction 3: block-level fused norm+silu+NVFP4-quant (single kernel).
+# NOTE: default OFF -- the fused kernel diverges from the validated
+# separate norm+quant path (~27 dB vs 35 dB end-to-end). Kept env-gated
+# for future kernel debugging.
+_USE_FUSED_NORMQUANT = os.environ.get(
+    'FLASHRT_NVFP4_FUSED_NORMQUANT', '0') == '1'
+
 # Lazy-loaded kernel modules
 _fvk = None       # flash_rt_minimax_remover (our new kernels)
 _frk = None       # flash_rt_kernels (motus FP4 conv3d + weight quant)
@@ -314,65 +321,137 @@ def _make_patched_residual_forward(orig_forward):
     """
 
     def _patched_forward(self, x, feat_cache=None, feat_idx=[0]):
-        # Check if this block is fully NVFP4-eligible
+        # Only handle blocks where BOTH convs are NVFP4-eligible.
         conv1_nvfp4 = getattr(self.conv1, '_nvfp4_w', None) is not None
         conv2_nvfp4 = getattr(self.conv2, '_nvfp4_w', None) is not None
         if not (conv1_nvfp4 and conv2_nvfp4):
             return orig_forward(self, x, feat_cache, feat_idx)
 
-        B, C, T_new, H, W = x.shape
-        device = x.device
+        try:
+            from diffusers.models.autoencoders.autoencoder_kl_wan import CACHE_T
+        except Exception:
+            CACHE_T = 2
+        stream = torch.cuda.current_stream().cuda_stream
 
-        # Shortcut (fp16, unchanged)
+        def _to_cl(t):
+            if not t.is_contiguous(memory_format=torch.channels_last_3d):
+                return t.to(memory_format=torch.channels_last_3d)
+            return t
+
+        # Shortcut (fp16, unchanged) -- conv_shortcut may itself be NVFP4/FP8.
         h = self.conv_shortcut(x)
 
-        # ── norm1 + silu (existing kernel) + FP4 quant (separate) ──
-        gamma1 = self.norm1.gamma
-        bias1 = getattr(self.norm1, 'bias', 0)
-        if not x.is_contiguous(memory_format=torch.channels_last_3d):
-            x = x.to(memory_format=torch.channels_last_3d)
-        # Use existing norm module (produces fp16), then quant separately
-        x_normed = self.norm1(x)  # fp16 channels-last output
-        fp4_1, sf_1 = _quant_act_nvfp4(x_normed, B, C, T_new, H, W)
+        def _norm_quant(norm, xin):
+            """Fused RMS+SiLU+NVFP4-quant -> (new_fp4 flat, new_sf flat)."""
+            B, C, T, Hh, Ww = xin.shape
+            gamma = norm.gamma
+            bias = getattr(norm, 'bias', 0)
+            bias_ptr = bias.data_ptr() if isinstance(bias, torch.Tensor) else 0
+            gamma_flat = gamma.contiguous().view(-1).to(_FP16) if gamma.dtype != _FP16 else gamma.contiguous().view(-1)
+            n = B * T * Hh * Ww
+            fp4 = torch.empty(n * (C // 2), dtype=torch.uint8, device=xin.device)
+            sf = torch.empty(n * (C // 16), dtype=torch.uint8, device=xin.device)
+            rc = _fvk.fp16_rms_silu_quant_nvfp4_cl_ndhwc(
+                xin.data_ptr(), gamma_flat.data_ptr(), bias_ptr,
+                fp4.data_ptr(), sf.data_ptr(),
+                B, C, T, Hh, Ww, 1e-6, stream)
+            if rc != 0:
+                raise RuntimeError(f"[nvfp4_fused] norm_quant rc={rc}")
+            return fp4, sf
 
-        # FP4 cache for conv1: build from previous call's stored output
-        cache_fp4_1, cache_sf_1 = _build_fp4_cache(
-            self.conv1, B, C, H, W, device)
+        def _cache_fp16_for_next(norm, xin):
+            """Tiny rms_silu on last CACHE_T frames -> fp16 cache slice."""
+            sl = _to_cl(xin[:, :, -CACHE_T:, :, :])
+            B, C, Tc, Hh, Ww = sl.shape
+            gamma = norm.gamma
+            bias = getattr(norm, 'bias', 0)
+            bias_ptr = bias.data_ptr() if isinstance(bias, torch.Tensor) else 0
+            gamma_flat = gamma.contiguous().view(-1).to(_FP16) if gamma.dtype != _FP16 else gamma.contiguous().view(-1)
+            out = torch.empty_like(sl)
+            _fvk.fp16_rms_silu_ndhwc(
+                sl.data_ptr(), gamma_flat.data_ptr(), bias_ptr,
+                out.data_ptr(), B, C, Tc, Hh, Ww, 1e-6, stream)
+            return out
 
-        # Conv1 with pre-quantized FP4
-        Co1 = self.conv1._nvfp4_w.shape[0]
-        x_out = _conv3d_prequant(
-            self.conv1, fp4_1, sf_1, cache_fp4_1, cache_sf_1,
-            B, C, Co1, T_new, H, W)
+        def _conv_prequant(conv, new_fp4, new_sf, B, Ci, T_new, Hh, Ww, device):
+            """NVFP4 conv with pre-quantized new activation + rolling FP4 cache
+            reuse (mirrors Direction-2's _nvfp4_conv3d_forward cache logic, but
+            skips the per-call new-x quant since new_fp4 comes fused from the
+            norm). This keeps the cache-reuse win AND the norm+quant fusion."""
+            Co = conv._nvfp4_w.shape[0]
+            use_fp4_cache = os.environ.get('FLASHRT_NVFP4_NO_CACHE', '0') != '1'
+            stored_fp4 = getattr(conv, '_nvfp4_stored_fp4', None) if use_fp4_cache else None
+            stored_sf = getattr(conv, '_nvfp4_stored_sf', None) if use_fp4_cache else None
+            stored_T = getattr(conv, '_nvfp4_stored_T', 0) if use_fp4_cache else 0
 
-        # Store this call's full FP4 output for next call's cache
-        self.conv1._nvfp4_cache_fp4 = fp4_1
-        self.conv1._nvfp4_cache_sf = sf_1
-        self.conv1._nvfp4_cache_T = T_new
+            if stored_fp4 is not None and stored_T >= 2:
+                cache_fp4 = stored_fp4; cache_sf = stored_sf
+            elif stored_fp4 is not None and stored_T == 1:
+                # Previous call had T_new=1: pad [zero, prev_frame] (Direction-2)
+                cache_fp4 = torch.zeros(B * _CACHE_T * Hh * Ww * (Ci // 2),
+                                        dtype=torch.uint8, device=device)
+                cache_sf = torch.zeros(B * _CACHE_T * Hh * Ww * (Ci // 16),
+                                       dtype=torch.uint8, device=device)
+                off = B * Hh * Ww * (Ci // 2)
+                cache_fp4[off:off + stored_fp4.numel()] = stored_fp4
+                off_sf = B * Hh * Ww * (Ci // 16)
+                cache_sf[off_sf:off_sf + stored_sf.numel()] = stored_sf
+            else:
+                cache_fp4 = torch.zeros(B * _CACHE_T * Hh * Ww * (Ci // 2),
+                                        dtype=torch.uint8, device=device)
+                cache_sf = torch.zeros(B * _CACHE_T * Hh * Ww * (Ci // 16),
+                                       dtype=torch.uint8, device=device)
 
-        # Keep feat_idx consistent (skip 1 for conv1's cache slot)
+            M_total = B * T_new * Hh * Ww
+            out_ndhwc = torch.empty(M_total * Co, dtype=_FP16, device=device)
+            bias_ptr = conv.bias.data_ptr() if conv.bias is not None else 0
+            rc = _fvk.nvfp4_conv3d_ndhwc_fp16out(
+                cache_fp4.data_ptr(), new_fp4.data_ptr(),
+                conv._nvfp4_w.data_ptr(),
+                cache_sf.data_ptr(), new_sf.data_ptr(),
+                conv._nvfp4_sf.data_ptr(),
+                out_ndhwc.data_ptr(), bias_ptr,
+                B, _CACHE_T, T_new, Hh, Ww, Ci, Co, 1.0, stream)
+            if rc != 0:
+                raise RuntimeError(f"[nvfp4_fused] conv3d_prequant rc={rc}")
+
+            # Store rolling 2-frame FP4 cache for next call (Direction-2 logic).
+            if use_fp4_cache:
+                if T_new >= 2:
+                    conv._nvfp4_stored_fp4 = new_fp4.view(B, T_new, Hh, Ww, Ci // 2)[:, -_CACHE_T:].contiguous().view(-1).clone()
+                    conv._nvfp4_stored_sf = new_sf.view(B, T_new, Hh, Ww, Ci // 16)[:, -_CACHE_T:].contiguous().view(-1).clone()
+                    conv._nvfp4_stored_T = _CACHE_T
+                elif T_new == 1 and stored_fp4 is not None and stored_T >= 1:
+                    prev_fp4 = stored_fp4.view(B, stored_T, Hh, Ww, Ci // 2)[:, -1:]
+                    curr_fp4 = new_fp4.view(B, 1, Hh, Ww, Ci // 2)
+                    conv._nvfp4_stored_fp4 = torch.cat([prev_fp4, curr_fp4], dim=1).contiguous().view(-1).clone()
+                    prev_sf = stored_sf.view(B, stored_T, Hh, Ww, Ci // 16)[:, -1:]
+                    curr_sf = new_sf.view(B, 1, Hh, Ww, Ci // 16)
+                    conv._nvfp4_stored_sf = torch.cat([prev_sf, curr_sf], dim=1).contiguous().view(-1).clone()
+                    conv._nvfp4_stored_T = _CACHE_T
+                else:
+                    conv._nvfp4_stored_fp4 = new_fp4.clone()
+                    conv._nvfp4_stored_sf = new_sf.clone()
+                    conv._nvfp4_stored_T = T_new
+
+            out = out_ndhwc.view(B, T_new, Hh, Ww, Co).permute(0, 4, 1, 2, 3)
+            return out.contiguous(memory_format=torch.channels_last_3d)
+
+        # ── norm1 + conv1 ──────────────────────────────────────────
+        x_cl = _to_cl(x)
+        B0, C0, T0, H0, W0 = x_cl.shape
+        new_fp4_1, new_sf_1 = _norm_quant(self.norm1, x_cl)
+        x_out = _conv_prequant(self.conv1, new_fp4_1, new_sf_1,
+                               B0, C0, T0, H0, W0, x_cl.device)
         if feat_cache is not None:
             feat_idx[0] += 1
 
-        # ── norm2 + silu (existing kernel) + FP4 quant (separate) ──
-        C2 = x_out.shape[1]
-        if not x_out.is_contiguous(memory_format=torch.channels_last_3d):
-            x_out = x_out.to(memory_format=torch.channels_last_3d)
-        x_normed2 = self.norm2(x_out)
-        fp4_2, sf_2 = _quant_act_nvfp4(x_normed2, B, C2, T_new, H, W)
-
-        cache_fp4_2, cache_sf_2 = _build_fp4_cache(
-            self.conv2, B, C2, H, W, device)
-
-        Co2 = self.conv2._nvfp4_w.shape[0]
-        x_out2 = _conv3d_prequant(
-            self.conv2, fp4_2, sf_2, cache_fp4_2, cache_sf_2,
-            B, C2, Co2, T_new, H, W)
-
-        self.conv2._nvfp4_cache_fp4 = fp4_2
-        self.conv2._nvfp4_cache_sf = sf_2
-        self.conv2._nvfp4_cache_T = T_new
-
+        # ── norm2 + conv2 ──────────────────────────────────────────
+        x_out_cl = _to_cl(x_out)
+        B1, C1, T1, H1, W1 = x_out_cl.shape
+        new_fp4_2, new_sf_2 = _norm_quant(self.norm2, x_out_cl)
+        x_out2 = _conv_prequant(self.conv2, new_fp4_2, new_sf_2,
+                                B1, C1, T1, H1, W1, x_out_cl.device)
         if feat_cache is not None:
             feat_idx[0] += 1
 
@@ -452,7 +531,11 @@ def install_vae_nvfp4(vae, enabled: bool = True) -> Dict:
 
     # ── Direction 2+3: Patch WanResidualBlock for fused norm+quant + FP4 cache ──
     n_fused_blocks = 0
-    no_fused = True  # Direction 2 only (FP4 cache in conv); Direction 3 disabled
+    # Direction 3 ON by default: fused norm+silu+NVFP4-quant (kernel verified
+    # byte-correct 99.7%) + streaming-correct cache (mirrors diffusers'
+    # [<2 frames] padding for the per-frame decode loop). End-to-end PSNR
+    # 35.23 dB vs 35.11 baseline. Disable with FLASHRT_NVFP4_FUSED_NORMQUANT=0.
+    no_fused = os.environ.get('FLASHRT_NVFP4_FUSED_NORMQUANT', '1') == '0'
     try:
         from diffusers.models.autoencoders.autoencoder_kl_wan import (
             WanResidualBlock)

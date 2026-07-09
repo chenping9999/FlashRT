@@ -20,6 +20,7 @@ layers).
 from __future__ import annotations
 
 import logging
+import os
 from typing import Dict
 
 import torch
@@ -531,6 +532,145 @@ def _fp8_conv3d_forward(self, x, cache_x=None):
     return out
 
 
+# ────────────────────────────────────────────────────────────────────────
+# FP8 fused norm+silu+running-amax+quant → prequant FP8 conv3d
+#
+# Patches WanResidualBlock.forward so that, for blocks whose conv1 AND
+# conv2 are FP8-eligible, the sister norm produces the FP8 activation
+# directly via ``fp16_rms_silu_amax_quant_fp8_ndhwc_nozero`` (one kernel:
+# RMSNorm + SiLU + accumulate-running-amax + FP8-quant). The conv then
+# only has to quantize the small causal cache (2 frames) and reuse the
+# prequant FP8 new-activation -- eliminating the large per-call fp16
+# round-trip between norm and conv (the bulk of ``quantize_..._dual``).
+#
+# Cache correctness: the causal cache (``feat_cache``) stays fp16 (last
+# CACHE_T frames of the norm output, computed via a tiny rms_silu on the
+# 2-frame slice) so it is re-quantized each call with the current running
+# scale -- exactly matching the baseline's shared-scale invariant.
+# ────────────────────────────────────────────────────────────────────────
+_FUSE_FP8_NORMQUANT = os.environ.get("FLASHRT_FP8_FUSED_NORMQUANT", "1") == "1"
+
+
+def _make_fp8_fused_residual_forward(orig_forward):
+    def _patched_forward(self, x, feat_cache=None, feat_idx=[0]):
+        # Only handle blocks where BOTH convs are FP8 (and NOT promoted to
+        # NVFP4 — install_vae_nvfp4 sets _nvfp4_w without clearing _fp8_w).
+        def _is_fp8(c):
+            return (getattr(c, '_fp8_w', None) is not None
+                    and getattr(c, '_nvfp4_w', None) is None)
+        c1_fp8 = _is_fp8(self.conv1)
+        c2_fp8 = _is_fp8(self.conv2)
+        if not (c1_fp8 and c2_fp8):
+            return orig_forward(self, x, feat_cache, feat_idx)
+
+        try:
+            from diffusers.models.autoencoders.autoencoder_kl_wan import CACHE_T
+        except Exception:
+            CACHE_T = 2
+        stream = torch.cuda.current_stream().cuda_stream
+        h = self.conv_shortcut(x)  # fp16 shortcut, unchanged
+
+        def _to_cl(t):
+            if not t.is_contiguous(memory_format=torch.channels_last_3d):
+                return t.to(memory_format=torch.channels_last_3d)
+            return t
+
+        def _norm_quant_fp8(norm, xin):
+            """RMSNorm+SiLU+running-amax+FP8-quant -> (new_fp8 flat, amax_buf)."""
+            B, C, T, Hh, Ww = xin.shape
+            xin = _to_cl(xin)
+            gamma_flat, bias_ptr = _prep_gamma_bias(norm.gamma, getattr(norm, 'bias', 0))
+            if norm._amax_buf is None or norm._amax_buf.device != xin.device:
+                norm._amax_buf = torch.zeros(1, dtype=torch.float32, device=xin.device)
+            n = B * T * Hh * Ww
+            new_fp8 = torch.empty(n * C, dtype=torch.float8_e4m3fn, device=xin.device)
+            scale_out = torch.empty(1, dtype=torch.float32, device=xin.device)
+            rc = _fvk.fp16_rms_silu_amax_quant_fp8_ndhwc_nozero(
+                xin.data_ptr(), gamma_flat.data_ptr(), bias_ptr,
+                new_fp8.data_ptr(), scale_out.data_ptr(),
+                norm._amax_buf.data_ptr(),
+                B, C, T, Hh, Ww, _EPS, stream)
+            if rc != 0:
+                raise RuntimeError(f"[fp8_fused] norm_quant rc={rc}")
+            return new_fp8, norm._amax_buf
+
+        def _cache_fp16_for_next(norm, xin):
+            """Tiny rms_silu on last CACHE_T frames -> fp16 cache slice."""
+            sl = xin[:, :, -CACHE_T:, :, :]
+            sl = _to_cl(sl)
+            B, C, Tc, Hh, Ww = sl.shape
+            gamma_flat, bias_ptr = _prep_gamma_bias(norm.gamma, getattr(norm, 'bias', 0))
+            out = torch.empty_like(sl)
+            _fvk.fp16_rms_silu_ndhwc(
+                sl.data_ptr(), gamma_flat.data_ptr(), bias_ptr,
+                out.data_ptr(), B, C, Tc, Hh, Ww, _EPS, stream)
+            return out
+
+        def _conv_prequant(conv, new_fp8, amax_buf, shape_in, cache_x_fp16):
+            B, Ci, T_new, Hh, Ww = shape_in
+            Co = conv._fp8_w.shape[0]
+            # resolve cache_2 [B,Ci,2,H,W] channels-last (mirror _fp8_conv3d_forward)
+            if cache_x_fp16 is not None and cache_x_fp16.shape[2] >= 2:
+                cache_2 = cache_x_fp16[:, :, -2:]
+                if not cache_2.is_contiguous(memory_format=torch.channels_last_3d):
+                    cache_2 = cache_2.to(memory_format=torch.channels_last_3d)
+            elif cache_x_fp16 is not None and cache_x_fp16.shape[2] >= 1:
+                cache_2 = torch.empty(B, Ci, 2, Hh, Ww, dtype=_FP16,
+                                      device=conv._fp8_w.device,
+                                      memory_format=torch.channels_last_3d).zero_()
+                cache_2[:, :, 1:2] = cache_x_fp16[:, :, -1:]
+            else:
+                cache_2 = torch.empty(B, Ci, 2, Hh, Ww, dtype=_FP16,
+                                      device=conv._fp8_w.device,
+                                      memory_format=torch.channels_last_3d).zero_()
+            n_cache = cache_2.numel()
+            cache_fp8 = torch.empty(n_cache, dtype=torch.float8_e4m3fn,
+                                    device=cache_2.device)
+            # quant cache with the running amax -> writes conv._fp8_scale
+            _fvk.quantize_fp16_fp8_with_amax(
+                cache_2.data_ptr(), cache_fp8.data_ptr(),
+                amax_buf.data_ptr(), conv._fp8_scale.data_ptr(),
+                n_cache, stream)
+            alpha_vec = conv._fp8_scale * conv._w_scale
+            out = torch.empty(B, Co, T_new, Hh, Ww, dtype=_FP16,
+                              device=new_fp8.device,
+                              memory_format=torch.channels_last_3d)
+            bias_ptr = conv.bias.data_ptr() if conv.bias is not None else 0
+            rc = _fvk.fp8_conv3d_mm_ndhwc_fp16out(
+                cache_fp8.data_ptr(), new_fp8.data_ptr(),
+                conv._fp8_w.data_ptr(), out.data_ptr(),
+                bias_ptr, alpha_vec.data_ptr(),
+                B, 2, T_new, Hh, Ww, Ci, Co, stream)
+            if rc != 0:
+                raise RuntimeError(f"[fp8_fused] conv3d_prequant rc={rc}")
+            return out
+
+        # ── norm1 + conv1 ──────────────────────────────────────────
+        x_cl = _to_cl(x)
+        B0, C0, T0, H0, W0 = x_cl.shape
+        new_fp8_1, amax_1 = _norm_quant_fp8(self.norm1, x_cl)
+        cache_in_1 = feat_cache[feat_idx[0]] if feat_cache is not None else None
+        x_out = _conv_prequant(self.conv1, new_fp8_1, amax_1,
+                               (B0, C0, T0, H0, W0), cache_in_1)
+        if feat_cache is not None:
+            feat_cache[feat_idx[0]] = _cache_fp16_for_next(self.norm1, x_cl)
+            feat_idx[0] += 1
+
+        # ── norm2 + conv2 ──────────────────────────────────────────
+        x_out_cl = _to_cl(x_out)
+        B1, C1, T1, H1, W1 = x_out_cl.shape
+        new_fp8_2, amax_2 = _norm_quant_fp8(self.norm2, x_out_cl)
+        cache_in_2 = feat_cache[feat_idx[0]] if feat_cache is not None else None
+        x_out2 = _conv_prequant(self.conv2, new_fp8_2, amax_2,
+                                (B1, C1, T1, H1, W1), cache_in_2)
+        if feat_cache is not None:
+            feat_cache[feat_idx[0]] = _cache_fp16_for_next(self.norm2, x_out_cl)
+            feat_idx[0] += 1
+
+        return x_out2 + h
+    return _patched_forward
+
+
 def _install_fp8_conv3d_pipeline(vae, enabled: bool = True) -> int:
     """Pre-quantize applicable Conv3d weights to FP8 e4m3 and patch
     WanCausalConv3d.forward to dispatch to the FP8 implicit-GEMM kernel.
@@ -618,6 +758,33 @@ def _install_fp8_conv3d_pipeline(vae, enabled: bool = True) -> int:
                         n_sister)
     except Exception as e:
         logger.debug("[minimax-vae] sister-norm link skipped: %s", e)
+
+    # ── FP8 fused norm+silu+running-amax+quant at residual-block level ──
+    # For blocks where BOTH conv1+conv2 are FP8-eligible, patch the block
+    # forward to produce the FP8 activation directly in the norm (one
+    # kernel) and feed it pre-quantized to the conv (which only re-quants
+    # the small causal cache). Eliminates the large fp16 round-trip.
+    if _FUSE_FP8_NORMQUANT:
+        try:
+            from diffusers.models.autoencoders.autoencoder_kl_wan import (
+                WanResidualBlock)
+            _orig_res_fwd = WanResidualBlock.forward
+            _patched = _make_fp8_fused_residual_forward(_orig_res_fwd)
+            n_blk = 0
+            for blk in vae.modules():
+                if isinstance(blk, WanResidualBlock):
+                    def _is_fp8(c):
+                        return (getattr(c, '_fp8_w', None) is not None
+                                and getattr(c, '_nvfp4_w', None) is None)
+                    if _is_fp8(blk.conv1) and _is_fp8(blk.conv2):
+                        n_blk += 1
+            if n_blk > 0:
+                WanResidualBlock.forward = _patched
+                logger.info("[minimax-vae] FP8 fused norm+silu+quant: "
+                            "%d WanResidualBlocks (prequant FP8 conv path)",
+                            n_blk)
+        except Exception as e:
+            logger.warning("[minimax-vae] FP8 fused residual patch failed: %s", e)
 
     logger.info("[minimax-vae] FP8 implicit-GEMM conv3d: %d layers "
                 "quantized, %d skipped (non-3x3x3 or Ci%%32!=0)",

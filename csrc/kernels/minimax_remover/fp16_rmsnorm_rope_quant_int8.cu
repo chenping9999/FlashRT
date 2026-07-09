@@ -44,6 +44,7 @@ __device__ __forceinline__ float warp_reduce_max_rq(float v) {
 template <int THREADS>
 __global__ void rmsnorm_rstd_kernel(
     const __half* __restrict__ x,   // [B*S, D]
+    const __half* __restrict__ bias, // [D] or nullptr — added before rmsnorm
     float* __restrict__ rstd_out,   // [B*S]
     int D, float eps)
 {
@@ -68,6 +69,16 @@ __global__ void rmsnorm_rstd_kernel(
         float2 f1 = __half22float2(h1);
         float2 f2 = __half22float2(h2);
         float2 f3 = __half22float2(h3);
+        if (bias) {
+            const uint4* pb = reinterpret_cast<const uint4*>(bias + v * VEC_RSTD);
+            uint4 rb = *pb;
+            float2 b0 = __half22float2(*reinterpret_cast<__half2*>(&rb.x));
+            float2 b1 = __half22float2(*reinterpret_cast<__half2*>(&rb.y));
+            float2 b2 = __half22float2(*reinterpret_cast<__half2*>(&rb.z));
+            float2 b3 = __half22float2(*reinterpret_cast<__half2*>(&rb.w));
+            f0.x += b0.x; f0.y += b0.y; f1.x += b1.x; f1.y += b1.y;
+            f2.x += b2.x; f2.y += b2.y; f3.x += b3.x; f3.y += b3.y;
+        }
         local_sq += f0.x*f0.x + f0.y*f0.y + f1.x*f1.x + f1.y*f1.y +
                     f2.x*f2.x + f2.y*f2.y + f3.x*f3.x + f3.y*f3.y;
     }
@@ -97,6 +108,7 @@ template <int GROUP_SIZE, int TPB>
 __global__ void norm_rope_quant_kernel(
     const __half* __restrict__ x,       // [B*S, D]
     const __half* __restrict__ weight,   // [D]
+    const __half* __restrict__ bias,     // [D] or nullptr — added before rmsnorm
     const float* __restrict__ cos_tab,   // [S, Dd/2]
     const float* __restrict__ sin_tab,   // [S, Dd/2]
     const float* __restrict__ rstd,      // [B*S]
@@ -139,9 +151,13 @@ __global__ void norm_rope_quant_kernel(
 
         const float my_rstd = rstd[global_tok];
 
-        // Load x values
+        // Load x values (+ bias, fused: avoids the separate add_bias kernel)
         float x0 = __half2float(x[(long long)global_tok * D + h * Dd + d0]);
         float x1 = __half2float(x[(long long)global_tok * D + h * Dd + d1]);
+        if (bias) {
+            x0 += __half2float(bias[h * Dd + d0]);
+            x1 += __half2float(bias[h * Dd + d1]);
+        }
 
         // Load weights
         float w0 = __half2float(weight[h * Dd + d0]);
@@ -214,6 +230,7 @@ __global__ void norm_rope_quant_kernel(
 int fp16_rmsnorm_rope_quant_int8_q(
     const void* x_fp16,
     const void* weight_fp16,
+    const void* bias_fp16,
     const void* cos_fp32,
     const void* sin_fp32,
     void* out_int8,
@@ -234,10 +251,11 @@ int fp16_rmsnorm_rope_quant_int8_q(
     cudaError_t e = cudaMallocAsync(&rstd_buf, B * S * sizeof(float), stream);
     if (e != cudaSuccess) return -4;
 
-    // Kernel A: compute rstd
+    // Kernel A: compute rstd (over x+bias)
     constexpr int THREADS_A = 128;
     rmsnorm_rstd_kernel<THREADS_A><<<B * S, THREADS_A, 0, stream>>>(
         reinterpret_cast<const __half*>(x_fp16),
+        bias_fp16 ? reinterpret_cast<const __half*>(bias_fp16) : nullptr,
         rstd_buf, D, eps);
 
     // Kernel B: norm + rope + quantize (Q: GROUP_SIZE=32)
@@ -250,6 +268,7 @@ int fp16_rmsnorm_rope_quant_int8_q(
     norm_rope_quant_kernel<GROUP_SIZE, TPB><<<grid, TPB, smem, stream>>>(
         reinterpret_cast<const __half*>(x_fp16),
         reinterpret_cast<const __half*>(weight_fp16),
+        bias_fp16 ? reinterpret_cast<const __half*>(bias_fp16) : nullptr,
         reinterpret_cast<const float*>(cos_fp32),
         reinterpret_cast<const float*>(sin_fp32),
         rstd_buf,
@@ -266,6 +285,7 @@ int fp16_rmsnorm_rope_quant_int8_q(
 int fp16_rmsnorm_rope_quant_int8_k(
     const void* x_fp16,
     const void* weight_fp16,
+    const void* bias_fp16,
     const void* cos_fp32,
     const void* sin_fp32,
     const void* km_fp16,
@@ -286,10 +306,11 @@ int fp16_rmsnorm_rope_quant_int8_k(
     cudaError_t e = cudaMallocAsync(&rstd_buf, B * S * sizeof(float), stream);
     if (e != cudaSuccess) return -4;
 
-    // Kernel A: compute rstd
+    // Kernel A: compute rstd (over x+bias)
     constexpr int THREADS_A = 128;
     rmsnorm_rstd_kernel<THREADS_A><<<B * S, THREADS_A, 0, stream>>>(
         reinterpret_cast<const __half*>(x_fp16),
+        bias_fp16 ? reinterpret_cast<const __half*>(bias_fp16) : nullptr,
         rstd_buf, D, eps);
 
     // Kernel B: norm + rope + quantize (K: GROUP_SIZE=64, with smooth_k)
@@ -302,6 +323,7 @@ int fp16_rmsnorm_rope_quant_int8_k(
     norm_rope_quant_kernel<GROUP_SIZE, TPB><<<grid, TPB, smem, stream>>>(
         reinterpret_cast<const __half*>(x_fp16),
         reinterpret_cast<const __half*>(weight_fp16),
+        bias_fp16 ? reinterpret_cast<const __half*>(bias_fp16) : nullptr,
         reinterpret_cast<const float*>(cos_fp32),
         reinterpret_cast<const float*>(sin_fp32),
         rstd_buf,

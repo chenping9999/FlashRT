@@ -209,14 +209,6 @@ class FlashRTFA2Processor:
                     and hasattr(attn.to_q, "gemm_from_fp8_ext")
                     and hasattr(attn.to_k, "gemm_from_fp8_ext")
                     and hasattr(attn.to_v, "gemm_from_fp8_ext"))
-        if _use_fp8:
-            q = attn.to_q.gemm_from_fp8_ext(fp8_hidden, fp8_scale)
-            k = attn.to_k.gemm_from_fp8_ext(fp8_hidden, fp8_scale)
-            v = attn.to_v.gemm_from_fp8_ext(fp8_hidden, fp8_scale)
-        else:
-            q = attn.to_q(hidden_states)
-            k = attn.to_k(hidden_states)
-            v = attn.to_v(hidden_states)
         cs = None
         if rotary_emb is not None:
             cs = self._cos_sin.get(S)
@@ -227,13 +219,30 @@ class FlashRTFA2Processor:
         _fuse_qk = (_has_fused_rmsnorm_rope and cs is not None
                     and attn.norm_q is not None and attn.norm_k is not None
                     and (Dd & 7) == 0)
-
         # ── Fully-fused path: RMSNorm + RoPE + int8 quant → sm89 attn ──
         # Eliminates the fp16 intermediate between norm+rope and QK quantize.
         _fuse_quant = (_fuse_qk and _has_fused_rmsnorm_rope_quant
                        and mode in ("sage_fp8", "sage2")
                        and _get_sm89() is not None
                        and _get_per_channel_fp8() is not None)
+
+        # Q/K GEMM: when the Q/K bias will be fused into the downstream
+        # rmsnorm+rope+quant kernel (pre-norm add), fetch Q/K WITHOUT bias
+        # to avoid adding it twice. V always keeps its bias (not normed).
+        _qk_nobias = (_use_fp8 and _fuse_quant
+                      and hasattr(attn.to_q, "gemm_from_fp8_ext_nobias"))
+        if _use_fp8:
+            if _qk_nobias:
+                q = attn.to_q.gemm_from_fp8_ext_nobias(fp8_hidden, fp8_scale)
+                k = attn.to_k.gemm_from_fp8_ext_nobias(fp8_hidden, fp8_scale)
+            else:
+                q = attn.to_q.gemm_from_fp8_ext(fp8_hidden, fp8_scale)
+                k = attn.to_k.gemm_from_fp8_ext(fp8_hidden, fp8_scale)
+            v = attn.to_v.gemm_from_fp8_ext(fp8_hidden, fp8_scale)
+        else:
+            q = attn.to_q(hidden_states)
+            k = attn.to_k(hidden_states)
+            v = attn.to_v(hidden_states)
         if _fuse_quant:
             if not q.is_contiguous():
                 q = q.contiguous()
@@ -251,13 +260,21 @@ class FlashRTFA2Processor:
             k_scale = torch.empty(B, H, num_groups_k, device=q.device,
                                   dtype=torch.float32)
 
+            # Q/K bias fused pre-norm when the nobias GEMM was used.
+            q_bias_ptr = (attn.to_q.bias.data_ptr()
+                          if (_qk_nobias and attn.to_q.bias is not None) else 0)
+            k_bias_ptr = (attn.to_k.bias.data_ptr()
+                          if (_qk_nobias and attn.to_k.bias is not None) else 0)
+
             _fvk.fp16_rmsnorm_rope_quant_int8_q(
                 q.data_ptr(), attn.norm_q.weight.data_ptr(),
+                q_bias_ptr,
                 cs[0].data_ptr(), cs[1].data_ptr(),
                 q_int8.data_ptr(), q_scale.data_ptr(),
                 B, S, H, Dd, float(attn.norm_q.eps), 1.0, stream)
             _fvk.fp16_rmsnorm_rope_quant_int8_k(
                 k.data_ptr(), attn.norm_k.weight.data_ptr(),
+                k_bias_ptr,
                 cs[0].data_ptr(), cs[1].data_ptr(),
                 0,  # no smooth_k (negligible impact, saves k.mean compute)
                 k_int8.data_ptr(), k_scale.data_ptr(),

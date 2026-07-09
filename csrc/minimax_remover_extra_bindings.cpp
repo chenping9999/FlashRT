@@ -389,6 +389,7 @@ PYBIND11_MODULE(flash_rt_minimax_remover, m) {
     // ── Fused RMSNorm + RoPE + int8 quantize (Q, per-warp) ──────────
     m.def("fp16_rmsnorm_rope_quant_int8_q",
         [](uintptr_t x_fp16, uintptr_t weight_fp16,
+           uintptr_t bias_fp16,
            uintptr_t cos_fp32, uintptr_t sin_fp32,
            uintptr_t out_int8, uintptr_t scale_fp32,
            int B, int S, int H, int Dd,
@@ -396,11 +397,13 @@ PYBIND11_MODULE(flash_rt_minimax_remover, m) {
             return flash_rt::kernels::minimax_remover::
                 fp16_rmsnorm_rope_quant_int8_q(
                 to_ptr(x_fp16), to_ptr(weight_fp16),
+                bias_fp16 ? to_ptr(bias_fp16) : nullptr,
                 to_ptr(cos_fp32), to_ptr(sin_fp32),
                 to_ptr(out_int8), to_ptr(scale_fp32),
                 B, S, H, Dd, eps, sm_scale, to_stream(stream));
         },
         py::arg("x_fp16"), py::arg("weight_fp16"),
+        py::arg("bias_fp16") = 0,
         py::arg("cos_fp32"), py::arg("sin_fp32"),
         py::arg("out_int8"), py::arg("scale_fp32"),
         py::arg("B"), py::arg("S"), py::arg("H"), py::arg("Dd"),
@@ -408,12 +411,15 @@ PYBIND11_MODULE(flash_rt_minimax_remover, m) {
         py::arg("stream") = 0,
         "Fused RMSNorm + RoPE + per-warp int8 quantization for Q. "
         "Eliminates the fp16 intermediate between norm+rope and quantize. "
+        "bias_fp16 (Q-proj bias) is added pre-norm (fused: replaces the "
+        "separate add_bias kernel); pass 0 to skip. "
         "Output: int8 [B*S, H*Dd], scale [B, H, ceil(S/32)]. "
         "sm_scale is folded into quantization (softmax scale pre-multiply).");
 
     // ── Fused RMSNorm + RoPE + int8 quantize (K, per-block + smooth_k) ─
     m.def("fp16_rmsnorm_rope_quant_int8_k",
         [](uintptr_t x_fp16, uintptr_t weight_fp16,
+           uintptr_t bias_fp16,
            uintptr_t cos_fp32, uintptr_t sin_fp32,
            uintptr_t km_fp16,
            uintptr_t out_int8, uintptr_t scale_fp32,
@@ -422,12 +428,14 @@ PYBIND11_MODULE(flash_rt_minimax_remover, m) {
             return flash_rt::kernels::minimax_remover::
                 fp16_rmsnorm_rope_quant_int8_k(
                 to_ptr(x_fp16), to_ptr(weight_fp16),
+                bias_fp16 ? to_ptr(bias_fp16) : nullptr,
                 to_ptr(cos_fp32), to_ptr(sin_fp32),
                 to_ptr(km_fp16),
                 to_ptr(out_int8), to_ptr(scale_fp32),
                 B, S, H, Dd, eps, sm_scale, to_stream(stream));
         },
         py::arg("x_fp16"), py::arg("weight_fp16"),
+        py::arg("bias_fp16") = 0,
         py::arg("cos_fp32"), py::arg("sin_fp32"),
         py::arg("km_fp16"),
         py::arg("out_int8"), py::arg("scale_fp32"),
@@ -436,6 +444,7 @@ PYBIND11_MODULE(flash_rt_minimax_remover, m) {
         py::arg("stream") = 0,
         "Fused RMSNorm + RoPE + per-block int8 quantization for K with "
         "smooth_k (subtract key mean). Eliminates fp16 intermediate. "
+        "bias_fp16 (K-proj bias) added pre-norm (fused); pass 0 to skip. "
         "Output: int8 [B*S, H*Dd], scale [B, H, ceil(S/64)]. "
         "km_fp16 can be 0 (nullptr) to skip smooth_k.");
 

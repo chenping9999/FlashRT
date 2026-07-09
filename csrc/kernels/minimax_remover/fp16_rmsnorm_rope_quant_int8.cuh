@@ -15,6 +15,7 @@ namespace minimax_remover {
 int fp16_rmsnorm_rope_quant_int8_q(
     const void* x_fp16,         // [B*S, H*Dd] fp16 input
     const void* weight_fp16,    // [H*Dd] fp16 norm weight
+    const void* bias_fp16,      // [H*Dd] fp16 Q-proj bias, or nullptr (fused pre-norm)
     const void* cos_fp32,       // [S, Dd/2] fp32
     const void* sin_fp32,       // [S, Dd/2] fp32
     void* out_int8,             // [B*S, H*Dd] int8 output
@@ -32,6 +33,7 @@ int fp16_rmsnorm_rope_quant_int8_q(
 int fp16_rmsnorm_rope_quant_int8_k(
     const void* x_fp16,         // [B*S, H*Dd] fp16 input
     const void* weight_fp16,    // [H*Dd] fp16 norm weight
+    const void* bias_fp16,      // [H*Dd] fp16 K-proj bias, or nullptr (fused pre-norm)
     const void* cos_fp32,       // [S, Dd/2] fp32
     const void* sin_fp32,       // [S, Dd/2] fp32
     const void* km_fp16,        // [B, 1, H, Dd] fp16 key mean (smooth_k)

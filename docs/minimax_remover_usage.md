@@ -213,9 +213,10 @@ That's 2 kernel launches + one full-tensor fp16 read-modify-write on
 occurrences per denoise**. `fp16_bias_gate_residual_bcast` collapses
 the pair into a single fp16x8 (uint4) kernel that reads `out` once,
 folds in the broadcast bias & gate, and writes straight into the
-residual — eliminating the intermediate RMW pass. `fp16_add_bias_vec8`
-vectorises the remaining Q/K/V scalar bias adds to 8× fewer memory
-transactions.
+residual — eliminating the intermediate RMW pass. The Q/K projection
+bias is fused directly into `fp16_rmsnorm_rope_quant_int8_q/k` (added
+pre-norm in fp32, see #3 above) so the Q/K `add_bias` kernel is gone
+entirely; `fp16_add_bias_vec8` now only handles V and proj_out.
 
 Result: **denoise GPU kernel time 3.10 s → 3.03 s** (-70 ms), end-to-end
 **7.56 s → 7.57 s** (wall time is CPU/launch-bound at 12 steps × 30
@@ -356,8 +357,9 @@ All rows compare against the non-FlashRT `--no-flashrt` fp16 reference on the
 | tennis (70 frames, 432x240) | FlashRT FP8 + VAE opt + CL + FP8 conv3d | 8.58 s | 2.02x | 39.9 / 36.4 dB | 0.99981 |
 | tennis (70 frames, 432x240) | FlashRT FP8 + VAE opt + CL + FP8 conv3d + fused FFN epilogue | 7.56 s | 2.29x | 40.0 / 36.4 dB | 0.99981 |
 | tennis (70 frames, 432x240) | FlashRT FP8 + VAE opt + CL + FP8 conv3d + fused FFN epilogue + fused bias-gate residual | 7.57 s | 2.30x | 40.0 / 36.2 dB | 0.99981 |
-| tennis (70 frames, 432x240) | **… + fused adaLN+quant (shared-scale QKV) + fused RMSNorm+RoPE + fused norm2+quant (default)** | **7.18 s** | **2.41x** | **40.0 / 36.0 dB** | 0.99981 |
+| tennis (70 frames, 432x240) | **… + fused adaLN+quant (shared-scale QKV) + fused RMSNorm+RoPE + fused norm2+quant (FP8-only stack, `--no-nvfp4-vae`)** | **7.18 s** | **2.41x** | **40.0 / 36.0 dB** | 0.99981 |
 | tennis (70 frames, 432x240) | **… + NVFP4 VAE (38 conv layers → W4A4, FP4 cache)** | **6.71 s** | **2.58x** | **34.7 / 30.6 dB** | 0.99981 |
+| tennis (70 frames, 432x240) | **… + NVFP4 fused norm+silu+quant + FP4 cache reuse (#1) + FP8 fused norm+silu+amax+quant (#2) + Q/K bias fused into rmsnorm+rope+quant (#3, current default)** | **6.56 s** | **2.64x** | **35.2 / 31.7 dB** | 0.99918 |
 | tennis (70 frames, 432x240) | FlashRT NVFP4 transformer (`--use-fp4`) | 9.52 s | 1.82x | 7.0 / 6.2 dB | 0.00000 (broken — transformer FP4 error accumulates over 12 denoise steps) |
 | bmx-trees (80 frames, 432x240) | fp16 reference (`--no-flashrt`) | 19.76 s | 1.0x | — | — |
 | bmx-trees (80 frames, 432x240) | FlashRT FP8 (default) | 13.24 s | **1.49x** | 35.1 / 32.0 dB | 0.99912 |
@@ -367,14 +369,20 @@ All rows compare against the non-FlashRT `--no-flashrt` fp16 reference on the
 > --no-vae-opt` vs default FlashRT FP8 stack) measured on RTX 5060 Ti,
 > CUDA 13.0, cuDNN 9.2, PyTorch 2.12. Run one process at a time —
 > parallel invocations contend on the GPU and inflate wall time.
-> Peak VRAM: fp16 ref 3.67 GB, FlashRT FP8 2.51 GB.
+> Peak VRAM: fp16 ref 3.67 GB, FlashRT default 2.57 GB.
+> Steady-state (2nd call, post-calibration): default FlashRT ~5.73 s
+> (~3.0× vs fp16 ref); single-call numbers above include the one-shot
+> FP8 calibration on the first call.
 
 Takeaways:
 
-- **FP8 + VAE opt + CL + FP8 conv3d + fused FFN epilogue + fused bias-gate residual + fused adaLN-quant (shared-scale QKV) + fused RMSNorm+RoPE is the recommended default**: 2.41x
-  faster than the fp16 reference (17.33 s → 7.18 s) with PSNR 40.0 dB (median,
-  39.93 dB mean over 69 inpainted frames) on full-frame tennis clip, peak VRAM
-  2.51 GB (vs 3.67 GB fp16 ref, –32%). The fused FFN epilogue kernel
+- **The current default** (all of the below + NVFP4 VAE + #1/#2/#3 fused
+  norm+quant/bias) is **2.64× faster** than the fp16 reference (17.34 →
+  6.56 s) with PSNR **35.2 dB** mean over 69 inpainted frames, peak VRAM
+  2.57 GB (vs 3.67 GB fp16 ref, –30%). Add `--no-nvfp4-vae` and set
+  `FLASHRT_NVFP4_FUSED_NORMQUANT=0 FLASHRT_FP8_FUSED_NORMQUANT=0` for the
+  higher-precision FP8-only stack (~40 dB, ~7.2 s) when absolute fidelity
+  matters more than speed. The fused FFN epilogue kernel
   (`bias_gelu_quant_fp16_fp8`) collapses bias-add + GELU + activation
   quantise into one pass, cutting denoise GPU time by 15% (3.73 → 3.16 s)
   and end-to-end from 8.58 → 7.56 s. The fused bias + gate + residual
@@ -407,6 +415,33 @@ Takeaways:
   (VAE total 3493→3002 ms, –16.4%). End-to-end 7.18→6.71 s (**2.58× vs fp16
   reference**). PSNR 34.7 dB (median) vs fp16 — «近乎一致（优秀）». Disable
   with `--no-nvfp4-vae`.
+- **Fused norm+quant + bias-into-rmsnorm (#1/#2/#3, default ON)**: three
+  additional fusion points, all quality-neutral (end-to-end PSNR unchanged
+  or slightly higher), contributing ~125 ms (~2.1%) steady-state:
+  - **#1 NVFP4 fused norm+silu+NVFP4-quant + FP4 cache reuse**
+    (`fp16_rms_silu_quant_nvfp4_cl_ndhwc`, env `FLASHRT_NVFP4_FUSED_NORMQUANT=1`):
+    the sister norm of each fully-NVFP4 `WanResidualBlock` produces the FP4
+    activation directly in one kernel (no fp16 round-trip), and the conv
+    reuses Direction-2's rolling 2-frame FP4 cache. **Critical**: the WanVAE
+    streams temporally (`_decode` loops one frame per call), so the cache
+    must mirror diffusers' `[prev, current]` padding — without it PSNR
+    collapses to ~27 dB.
+  - **#2 FP8 fused norm+silu+running-amax+FP8-quant**
+    (`fp16_rms_silu_amax_quant_fp8_ndhwc_nozero`, env
+    `FLASHRT_FP8_FUSED_NORMQUANT=1`): same idea for the FP8-conv residual
+    blocks. Uses the `_nozero` variant (accumulates into the running amax
+    instead of zeroing) so the new-x FP4 scale stays consistent with the
+    causal cache's running scale.
+  - **#3 Q/K bias fused into rmsnorm+RoPE+int8-quant**: cuBLASLt's
+    `CUBLASLT_EPILOGUE_BIAS` is NOT_SUPPORTED for FP8 (e4m3) GEMMs, so the
+    Q/K bias is fused into the *downstream* `fp16_rmsnorm_rope_quant_int8`
+    kernel (added pre-norm in fp32). Eliminates 720 of 1092 `add_bias_vec8`
+    calls per denoise (Q+K of every block); V and proj_out keep their bias
+    (V is not normed downstream). `gemm_from_fp8_ext_nobias` feeds the
+    no-bias Q/K GEMM output.
+  Combined steady-state 5.86 → 5.73 s; PSNR 35.16 dB mean / 31.73 worst
+  (vs 35.11 at the pre-fusion baseline) — the fp32 bias add in #3 is
+  slightly *more* precise than the fp16 bias-add it replaces.
 - **NVFP4 transformer (`--use-fp4`) is unusable on full-frame latents**: cosine collapses to
   ~0.0 and PSNR to ~7 dB (median per-pixel deviation ~85/255). The FP4
   quantisation error accumulates over the 12-step denoise loop in the transformer
@@ -450,8 +485,9 @@ to the quantised GEMMs and the attention backend.
 | NVFP4 W4A4 GEMM | cosine vs fp16 matmul | >= 0.999 |
 | FP8 W8A8 GEMM | cosine vs fp16 matmul | >= 0.999 |
 | End-to-end FP8 (full-frame) | PSNR vs fp16 ref | 35-41 dB (mean 39.9) / >= 36 dB (worst frame) |
-| End-to-end FP8 + NVFP4 VAE (full-frame) | PSNR vs fp16 ref | 34.7 dB (median) / >= 30.6 dB (worst frame) |
-| End-to-end FP8 + NVFP4 VAE (full-frame) | PSNR vs FP8 baseline | 34.3 dB (median) / >= 31.0 dB (worst frame) |
+| End-to-end FP8 + NVFP4 VAE (full-frame) | PSNR vs fp16 ref | 35.2 dB (mean) / >= 31.7 dB (worst frame) |
+| End-to-end FP8 + NVFP4 VAE (full-frame) | PSNR vs FP8 baseline | 35.8 dB (mean) — same math, fp4/fp8 quant noise only |
+| End-to-end FP8 + NVFP4 VAE (full-frame) | cosine vs fp16 ref | >= 0.99918 (mean 0.99918) |
 | End-to-end FP8 (full-frame) | cosine vs fp16 ref | >= 0.999 |
 | End-to-end NVFP4 transformer (full-frame) | cosine vs fp16 ref | ~0.0 — **broken**, output drifts to black (FP4 error accumulates over 12 denoise steps in the transformer) |
 | End-to-end NVFP4 (small cropped region only) | PSNR vs fp16 ref | ~52 dB (mean) / ~45 dB (worst frame); per-block FP4 error stays bounded only when activations are small |
@@ -487,7 +523,10 @@ the steady state; the FP8 path calibrates on the first call then freezes.
 | `FLASHRT_NVFP4_VAE_DECODE_ONLY` | `0` | `1` = apply NVFP4 only to decoder (encoder stays FP8); `0` = both encode+decode. |
 | `FLASHRT_NVFP4_VAE_MIN_CI` | `192` | Minimum Ci for NVFP4 eligibility. 192 covers WanVAE Ci=192/384; 384 is stricter (better PSNR, fewer layers). |
 | `FLASHRT_NVFP4_NO_CACHE` | `0` | `1` = disable FP4 cache (re-quantize cache per call); `0` = use rolling 2-frame FP4 cache (default, faster). |
-| `FLASHRT_NVFP4_NO_FUSED_BLOCKS` | `1` | `1` = don't patch WanResidualBlock.forward for fused norm+quant (default ON — separate norm+quant is more precise); `0` = enable fused block forward (faster but ~2 dB PSNR drop). |
+| `FLASHRT_NVFP4_FUSED_NORMQUANT` | `1` | #1: `1` (default) = patch `WanResidualBlock.forward` for fully-NVFP4 blocks so the sister norm emits FP4 directly (fused norm+silu+NVFP4-quant) and the conv reuses the rolling FP4 cache. `0` = separate norm→fp16→quant path (Direction-2). |
+| `FLASHRT_FP8_FUSED_NORMQUANT` | `1` | #2: `1` (default) = same fused norm+silu+running-amax+FP8-quant for the FP8-conv residual blocks (`fp16_rms_silu_amax_quant_fp8_ndhwc_nozero`). `0` = separate norm+amax then quantize_dual. |
+| `FLASHRT_FP8_EAGER_MANUAL` | `1` | `1` (default) = steady-state denoise runs the eager manual loop (avoids per-step `torch.cat` + scheduler CPU sync). `0` = diffusers `__call__`. |
+| `FLASHRT_FP8_GRAPH` | `0` | `1` = capture the whole denoise loop as one CUDA Graph (FP8 path; loses ~1.1 s due to forcing a slower graph-safe attention backend — not recommended). |
 
 ## Usage
 

@@ -155,7 +155,14 @@ class MiniMaxRemoverPipelineFP8:
                 handle.remove()
         elif use_graph:
             # Frozen scales + graph requested: manual graph-capturable path.
-            result = self._manual_call(*args, **kwargs)
+            result = self._manual_call(*args, use_graph=True, **kwargs)
+        elif os.environ.get("FLASHRT_FP8_EAGER_MANUAL", "1") == "1":
+            # Steady-state: eager manual denoise (avoids the per-step
+            # torch.cat of [latents, masked, masks] and the scheduler.step
+            # CPU sync of the diffusers path). masked/masks latents are
+            # constant across steps; _denoise_loop_body copies only the
+            # changing latents slice into a persistent concat buffer.
+            result = self._manual_call(*args, use_graph=False, **kwargs)
         else:
             result = self._orig_pipe_call(*args, **kwargs)
         return result
@@ -163,7 +170,7 @@ class MiniMaxRemoverPipelineFP8:
     @torch.no_grad()
     def _manual_call(self, images, masks, num_frames, height, width,
                      num_inference_steps=12, generator=None, iterations=16,
-                     output_type="np"):
+                     output_type="np", use_graph=False):
         """Manual encode + graph-denoise + decode (mirrors the diffusers
         ``MinimaxRemoverPipeline.__call__`` but replaces the denoise loop
         with the CUDA-graph-capturable ``FP8ManualDenoise``). Requires
@@ -205,7 +212,7 @@ class MiniMaxRemoverPipelineFP8:
 
         result_latents = self._graph_denoise.denoise(
             latents, masked_latents, masks_latents, num_inference_steps,
-            use_graph=True)
+            use_graph=use_graph)
 
         result_latents = (result_latents.to(self._vae_dtype) / latents_std
                           + latents_mean)
