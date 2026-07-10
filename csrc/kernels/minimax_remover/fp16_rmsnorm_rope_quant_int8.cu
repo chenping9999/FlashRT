@@ -31,13 +31,6 @@ __device__ __forceinline__ float warp_reduce_sum_rq(float v) {
     return v;
 }
 
-__device__ __forceinline__ float warp_reduce_max_rq(float v) {
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, off));
-    return v;
-}
-
 // ─── Kernel A: compute rstd per token ─────────────────────────────
 // Grid: (B*S), Block: 128 threads
 // Reads D fp16 elements, reduces sum-of-squares, writes 1 float.
@@ -237,6 +230,7 @@ int fp16_rmsnorm_rope_quant_int8_q(
     void* scale_fp32,
     int B, int S, int H, int Dd,
     float eps, float sm_scale,
+    void* rstd_buf,
     cudaStream_t stream)
 {
     if (!x_fp16 || !weight_fp16 || !cos_fp32 || !sin_fp32 ||
@@ -246,17 +240,24 @@ int fp16_rmsnorm_rope_quant_int8_q(
     const int D = H * Dd;
     if ((D % VEC_RSTD) != 0) return -3;
 
-    // Allocate temp buffer for rstd on the stream
-    float* rstd_buf;
-    cudaError_t e = cudaMallocAsync(&rstd_buf, B * S * sizeof(float), stream);
-    if (e != cudaSuccess) return -4;
+    // rstd scratch: prefer the caller-owned buffer (hot path, zero alloc).
+    // Fall back to a stream-ordered transient allocation only when the
+    // caller passes nullptr (one-off / non-hot-path use).
+    float* rstd = static_cast<float*>(rstd_buf);
+    float* transient = nullptr;
+    if (rstd == nullptr) {
+        cudaError_t e = cudaMallocAsync(&transient,
+                                        B * S * sizeof(float), stream);
+        if (e != cudaSuccess) return -4;
+        rstd = transient;
+    }
 
     // Kernel A: compute rstd (over x+bias)
     constexpr int THREADS_A = 128;
     rmsnorm_rstd_kernel<THREADS_A><<<B * S, THREADS_A, 0, stream>>>(
         reinterpret_cast<const __half*>(x_fp16),
         bias_fp16 ? reinterpret_cast<const __half*>(bias_fp16) : nullptr,
-        rstd_buf, D, eps);
+        rstd, D, eps);
 
     // Kernel B: norm + rope + quantize (Q: GROUP_SIZE=32)
     constexpr int GROUP_SIZE = 32;
@@ -271,14 +272,15 @@ int fp16_rmsnorm_rope_quant_int8_q(
         bias_fp16 ? reinterpret_cast<const __half*>(bias_fp16) : nullptr,
         reinterpret_cast<const float*>(cos_fp32),
         reinterpret_cast<const float*>(sin_fp32),
-        rstd_buf,
+        rstd,
         nullptr,  // no km for Q
         reinterpret_cast<int8_t*>(out_int8),
         reinterpret_cast<float*>(scale_fp32),
         B, S, H, Dd, sm_scale);
 
-    cudaFreeAsync(rstd_buf, stream);
-    e = cudaGetLastError();
+    if (transient != nullptr)
+        cudaFreeAsync(transient, stream);
+    cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : -5;
 }
 
@@ -293,6 +295,7 @@ int fp16_rmsnorm_rope_quant_int8_k(
     void* scale_fp32,
     int B, int S, int H, int Dd,
     float eps, float sm_scale,
+    void* rstd_buf,
     cudaStream_t stream)
 {
     if (!x_fp16 || !weight_fp16 || !cos_fp32 || !sin_fp32 ||
@@ -302,16 +305,22 @@ int fp16_rmsnorm_rope_quant_int8_k(
     const int D = H * Dd;
     if ((D % VEC_RSTD) != 0) return -3;
 
-    float* rstd_buf;
-    cudaError_t e = cudaMallocAsync(&rstd_buf, B * S * sizeof(float), stream);
-    if (e != cudaSuccess) return -4;
+    // rstd scratch: prefer the caller-owned buffer (hot path, zero alloc).
+    float* rstd = static_cast<float*>(rstd_buf);
+    float* transient = nullptr;
+    if (rstd == nullptr) {
+        cudaError_t e = cudaMallocAsync(&transient,
+                                        B * S * sizeof(float), stream);
+        if (e != cudaSuccess) return -4;
+        rstd = transient;
+    }
 
     // Kernel A: compute rstd (over x+bias)
     constexpr int THREADS_A = 128;
     rmsnorm_rstd_kernel<THREADS_A><<<B * S, THREADS_A, 0, stream>>>(
         reinterpret_cast<const __half*>(x_fp16),
         bias_fp16 ? reinterpret_cast<const __half*>(bias_fp16) : nullptr,
-        rstd_buf, D, eps);
+        rstd, D, eps);
 
     // Kernel B: norm + rope + quantize (K: GROUP_SIZE=64, with smooth_k)
     constexpr int GROUP_SIZE = 64;
@@ -326,14 +335,15 @@ int fp16_rmsnorm_rope_quant_int8_k(
         bias_fp16 ? reinterpret_cast<const __half*>(bias_fp16) : nullptr,
         reinterpret_cast<const float*>(cos_fp32),
         reinterpret_cast<const float*>(sin_fp32),
-        rstd_buf,
+        rstd,
         km_fp16 ? reinterpret_cast<const __half*>(km_fp16) : nullptr,
         reinterpret_cast<int8_t*>(out_int8),
         reinterpret_cast<float*>(scale_fp32),
         B, S, H, Dd, sm_scale);
 
-    cudaFreeAsync(rstd_buf, stream);
-    e = cudaGetLastError();
+    if (transient != nullptr)
+        cudaFreeAsync(transient, stream);
+    cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : -5;
 }
 

@@ -266,18 +266,60 @@ def test_fp8_pipeline_call_does_not_patch_pipe_class(monkeypatch):
     """Wrapping one FP8 pipe must not alter all instances of that pipe class."""
     from flash_rt.models.minimax_remover import _fp8_pipeline
 
+    # Exercise the delegation path (orig pipe __call__) rather than the
+    # eager-manual denoise default, so the stub does not need a real
+    # transformer/scheduler. The class-isolation guarantee under test is
+    # independent of the steady-state dispatch mode.
+    monkeypatch.setenv("FLASHRT_FP8_EAGER_MANUAL", "0")
+
+    class _Param:
+        dtype = "fp16"
+
     class _Transformer:
+        def __init__(self):
+            self.config = types.SimpleNamespace(eps=1e-6)
+            self._hooks = []
+
         def to(self, _dtype):
             return self
+
+        def parameters(self):
+            return iter([_Param()])
+
+        def register_forward_hook(self, fn):
+            self._hooks.append(fn)
+
+            class _Handle:
+                def __init__(self, hooks, f):
+                    self._hooks = hooks
+                    self._f = f
+
+                def remove(self):
+                    if self._f in self._hooks:
+                        self._hooks.remove(self._f)
+
+            return _Handle(self._hooks, fn)
+
+        def _fire_hooks(self):
+            for fn in list(self._hooks):
+                fn(self, None, None)
+
+    class _Vae:
+        def parameters(self):
+            return iter([_Param()])
 
     class _CallablePipe:
         def __init__(self, name):
             self.name = name
             self.transformer = _Transformer()
+            self.vae = _Vae()
             self.calls = []
 
         def __call__(self, *args, **kwargs):
             self.calls.append((args, kwargs))
+            # Simulate the transformer forward so the one-shot calibration
+            # freeze hook fires during the wrapped pipe's first call.
+            self.transformer._fire_hooks()
             return self.name, args, kwargs
 
     set_calibration_calls = []
@@ -321,6 +363,12 @@ def test_fp8_pipeline_call_does_not_patch_pipe_class(monkeypatch):
         "pipe1", ("wrapped",), {"flag": True})
     assert set_calibration_calls == [True]
     assert freeze_calls == [1.1]
+    assert wrapped._calibrated
+
+    assert wrapped("again") == ("pipe1", ("again",), {})
+    assert set_calibration_calls == [True]
+    assert freeze_calls == [1.1]
+
     assert wrapped._calibrated
 
     assert wrapped("again") == ("pipe1", ("again",), {})

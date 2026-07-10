@@ -40,11 +40,12 @@ _FP16 = torch.float16
 _BF16 = torch.bfloat16
 
 # Direction 3: block-level fused norm+silu+NVFP4-quant (single kernel).
-# NOTE: default OFF -- the fused kernel diverges from the validated
-# separate norm+quant path (~27 dB vs 35 dB end-to-end). Kept env-gated
-# for future kernel debugging.
-_USE_FUSED_NORMQUANT = os.environ.get(
-    'FLASHRT_NVFP4_FUSED_NORMQUANT', '0') == '1'
+# Default ON (FLASHRT_NVFP4_FUSED_NORMQUANT=1): the fused kernel emits the
+# FP4 activation directly from the norm (no fp16 round-trip) and the conv
+# reuses the rolling 2-frame FP4 cache. End-to-end PSNR 35.23 dB vs 35.11
+# baseline. The actual gate is read in install_vae_nvfp4() below.
+# Set FLASHRT_NVFP4_FUSED_NORMQUANT=0 to fall back to the separate
+# norm→fp16→quant path (Direction-2 cache only).
 
 # Lazy-loaded kernel modules
 _fvk = None       # flash_rt_minimax_remover (our new kernels)
@@ -358,20 +359,6 @@ def _make_patched_residual_forward(orig_forward):
             if rc != 0:
                 raise RuntimeError(f"[nvfp4_fused] norm_quant rc={rc}")
             return fp4, sf
-
-        def _cache_fp16_for_next(norm, xin):
-            """Tiny rms_silu on last CACHE_T frames -> fp16 cache slice."""
-            sl = _to_cl(xin[:, :, -CACHE_T:, :, :])
-            B, C, Tc, Hh, Ww = sl.shape
-            gamma = norm.gamma
-            bias = getattr(norm, 'bias', 0)
-            bias_ptr = bias.data_ptr() if isinstance(bias, torch.Tensor) else 0
-            gamma_flat = gamma.contiguous().view(-1).to(_FP16) if gamma.dtype != _FP16 else gamma.contiguous().view(-1)
-            out = torch.empty_like(sl)
-            _fvk.fp16_rms_silu_ndhwc(
-                sl.data_ptr(), gamma_flat.data_ptr(), bias_ptr,
-                out.data_ptr(), B, C, Tc, Hh, Ww, 1e-6, stream)
-            return out
 
         def _conv_prequant(conv, new_fp4, new_sf, B, Ci, T_new, Hh, Ww, device):
             """NVFP4 conv with pre-quantized new activation + rolling FP4 cache

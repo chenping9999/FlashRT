@@ -12,6 +12,9 @@ namespace minimax_remover {
 //           where num_scale_groups = ceil(S / WARPQ) * (BLKQ / WARPQ)
 //           For BLKQ=128, WARPQ=32: num_scale_groups = ceil(S/128) * 4
 // Each scale covers WARPQ=32 consecutive tokens for one head.
+// rstd_buf: caller-owned scratch of B*S floats for the per-token rstd
+//           reduction. Pass nullptr to use a stream-ordered transient
+//           allocation (slower; for one-off / non-hot-path callers).
 int fp16_rmsnorm_rope_quant_int8_q(
     const void* x_fp16,         // [B*S, H*Dd] fp16 input
     const void* weight_fp16,    // [H*Dd] fp16 norm weight
@@ -22,6 +25,7 @@ int fp16_rmsnorm_rope_quant_int8_q(
     void* scale_fp32,           // [B, H, ceil(S/128)*4] fp32
     int B, int S, int H, int Dd,
     float eps, float sm_scale,
+    void* rstd_buf,             // [B*S] fp32 caller-owned scratch, or nullptr
     cudaStream_t stream);
 
 // Fused RMSNorm + RoPE + per-block int8 quantization + smooth_k (for K).
@@ -30,6 +34,8 @@ int fp16_rmsnorm_rope_quant_int8_q(
 //         scale [B, H, ceil(S/64)] fp32
 // Each scale covers BLKK=64 consecutive tokens for one head.
 // smooth_k: subtract per-head mean (km) before quantization.
+// rstd_buf: caller-owned scratch of B*S floats (see _q above); nullptr
+//           falls back to a stream-ordered transient allocation.
 int fp16_rmsnorm_rope_quant_int8_k(
     const void* x_fp16,         // [B*S, H*Dd] fp16 input
     const void* weight_fp16,    // [H*Dd] fp16 norm weight
@@ -41,6 +47,7 @@ int fp16_rmsnorm_rope_quant_int8_k(
     void* scale_fp32,           // [B, H, ceil(S/64)] fp32
     int B, int S, int H, int Dd,
     float eps, float sm_scale,
+    void* rstd_buf,             // [B*S] fp32 caller-owned scratch, or nullptr
     cudaStream_t stream);
 
 }  // namespace minimax_remover

@@ -322,9 +322,10 @@ class FlashRTFp8Linear(nn.Module):
         """Same as gemm_from_fp8_ext but WITHOUT the bias-add.
 
         For the fully-fused attention path where the Q/K bias is added
-        inside the downstream ``fp16_rmsnorm_rope_bias_quant_int8`` kernel
-        (fused pre-norm) -- avoids the separate ``add_bias_vec8`` kernel
-        and its fp16 output round-trip.
+        inside the downstream ``fp16_rmsnorm_rope_quant_int8_q`` /
+        ``fp16_rmsnorm_rope_quant_int8_k`` kernel (fused pre-norm) --
+        avoids the separate ``add_bias_vec8`` kernel and its fp16 output
+        round-trip.
         """
         if self.calibrating:
             raise RuntimeError("gemm_from_fp8_ext_nobias is only valid post-calibration")

@@ -189,6 +189,9 @@ class FlashRTFA2Processor:
     def __init__(self):
         self._lse_bufs = {}
         self._cos_sin = {}
+        # Persistent [B*S] fp32 scratch for the fused rmsnorm+rope+int8-quant
+        # Q/K kernels (avoids a per-call cudaMallocAsync in the hot path).
+        self._rstd_bufs = {}
 
     def __call__(self, attn, hidden_states, rotary_emb=None,
                  attention_mask=None, encoder_hidden_states=None,
@@ -266,19 +269,38 @@ class FlashRTFA2Processor:
             k_bias_ptr = (attn.to_k.bias.data_ptr()
                           if (_qk_nobias and attn.to_k.bias is not None) else 0)
 
-            _fvk.fp16_rmsnorm_rope_quant_int8_q(
+            # Reuse a persistent rstd scratch (B*S fp32) across Q/K calls so
+            # the fused kernel does zero hot-path allocation. Q and K run
+            # sequentially on the same stream, so one buffer serves both.
+            rstd = self._rstd_bufs.get((B, S))
+            if rstd is None or rstd.device != q.device:
+                rstd = torch.empty(B * S, dtype=torch.float32, device=q.device)
+                self._rstd_bufs[(B, S)] = rstd
+            rstd_ptr = rstd.data_ptr()
+
+            rc = _fvk.fp16_rmsnorm_rope_quant_int8_q(
                 q.data_ptr(), attn.norm_q.weight.data_ptr(),
                 q_bias_ptr,
                 cs[0].data_ptr(), cs[1].data_ptr(),
                 q_int8.data_ptr(), q_scale.data_ptr(),
-                B, S, H, Dd, float(attn.norm_q.eps), 1.0, stream)
-            _fvk.fp16_rmsnorm_rope_quant_int8_k(
+                B, S, H, Dd, float(attn.norm_q.eps), 1.0,
+                rstd_ptr, stream)
+            if rc != 0:
+                raise RuntimeError(
+                    f"fp16_rmsnorm_rope_quant_int8_q failed rc={rc} "
+                    f"(B={B} S={S} H={H} Dd={Dd})")
+            rc = _fvk.fp16_rmsnorm_rope_quant_int8_k(
                 k.data_ptr(), attn.norm_k.weight.data_ptr(),
                 k_bias_ptr,
                 cs[0].data_ptr(), cs[1].data_ptr(),
                 0,  # no smooth_k (negligible impact, saves k.mean compute)
                 k_int8.data_ptr(), k_scale.data_ptr(),
-                B, S, H, Dd, float(attn.norm_k.eps), 1.0, stream)
+                B, S, H, Dd, float(attn.norm_k.eps), 1.0,
+                rstd_ptr, stream)
+            if rc != 0:
+                raise RuntimeError(
+                    f"fp16_rmsnorm_rope_quant_int8_k failed rc={rc} "
+                    f"(B={B} S={S} H={H} Dd={Dd})")
 
             v = v.view(B, S, H, Dd)
             if not v.is_contiguous():
