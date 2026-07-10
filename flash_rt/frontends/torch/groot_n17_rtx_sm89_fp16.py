@@ -14,6 +14,7 @@ from __future__ import annotations
 import math
 import os
 import glob
+import time
 
 import torch
 
@@ -364,6 +365,7 @@ class GrootN17TorchFrontendRtxSm89FP16(GrootN17TorchFrontendRtx):
             self._warmup_infer()
         except Exception as e:  # noqa: BLE001
             warnings.warn(f"set_prompt warmup failed (non-fatal): {e!r}")
+        self.latency_records.clear()
 
     def _run_kernel_backbone(self, aux: dict) -> "torch.Tensor":
         """Run ViT → DeepStack → LLM → vlln → VL-self-attn through FP16 kernels.
@@ -569,6 +571,8 @@ class GrootN17TorchFrontendRtxSm89FP16(GrootN17TorchFrontendRtx):
     ) -> torch.Tensor:
         if not hasattr(self, "_backbone_features"):
             raise RuntimeError("call set_prompt before infer")
+
+        t0 = time.perf_counter()
         if not hasattr(self, "_dit_cross_K"):
             self._precompute_dit_cross_kv()
 
@@ -637,6 +641,8 @@ class GrootN17TorchFrontendRtxSm89FP16(GrootN17TorchFrontendRtx):
             velocity = self._run_action_decode(h_out[:, -action_horizon:])
             actions = actions + (dt * velocity).to(actions.dtype)
 
+        torch.cuda.synchronize()
+        self.latency_records.append((time.perf_counter() - t0) * 1000)
         return actions.float()
 
     def _warmup_infer(self) -> None:

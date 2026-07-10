@@ -227,6 +227,7 @@ class _GrootN17FP8BackboneMixin:
             self._warmup_infer()
         except Exception as e:  # noqa: BLE001
             warnings.warn(f"set_prompt warmup failed (non-fatal): {e!r}")
+        self.latency_records.clear()
 
     def _run_kernel_backbone_fp8(self, aux: dict) -> "torch.Tensor":
         import flash_rt.flash_rt_kernels as fvk

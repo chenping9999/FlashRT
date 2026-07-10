@@ -4,15 +4,11 @@ Public surface mirrors ``GrootTorchFrontendThor`` (N1.6):
 
 * ``__init__(checkpoint_path, num_views, embodiment_tag, ...)``
 * ``set_prompt(prompt: str, embodiment_tag: str | None = None)``
-* ``infer(observation: dict) -> np.ndarray``  # (action_horizon=40, 132)
+* ``infer(state_normalized) -> torch.Tensor``  # (1, action_horizon, 132)
 * ``predict(...)`` — alias kept for API parity
-* ``get_latency_stats()``
-
-
-This commit (Phase 3c.a) lands the foundation: ``__init__`` +
-``_load_weights`` driven by ``MultiSafetensorsSource`` and the
-declarative ``WEIGHT_SPEC`` (Phase 3a). ``set_prompt``/``infer`` are
-still stubbed.
+* ``normalize_state(state_dict) -> torch.Tensor``
+* ``denormalize_action(action_normed, state_dict) -> dict``
+* ``get_latency_stats() -> dict``
 """
 
 from __future__ import annotations
@@ -20,23 +16,22 @@ from __future__ import annotations
 import glob
 import os
 import pathlib
+import time
 import warnings
 from typing import Optional
 
 import torch
 
+from flash_rt.frontends._fp8_layout import select_fp8_layout
+
 
 class GrootN17TorchFrontendThor:
     """N1.7 Thor inference frontend.
 
-    Phase 3c lands in 4 stages:
-      a. ``_load_weights`` (this commit) — full WEIGHT_SPEC across 2 ckpt
-         shards via MultiSafetensorsSource; per-embodiment slot slicing
-         on the dense (32, ·, ·) tensors.
-      b. ``set_prompt`` — Qwen3-VL processor, M-RoPE cos/sin (mrope_table),
-         timestep emb, DiT cross-KV precompute, calibration cache.
-      c. eager ``infer`` (no graphs).
-      d. CUDA Graph capture for vit / llm / vl_self_attn / dit-per-step.
+    Loads weights from a GR00T-N1.7-3B checkpoint via ``MultiSafetensorsSource``
+    and the declarative ``WEIGHT_SPEC``. Supports per-embodiment slot slicing,
+    FP8 activation calibration, CUDA Graph captured DiT, and fully-kernelized
+    backbone + DiT graph replay.
     """
 
     # Run the DiT action head's compute-bound GEMMs (FFN + self-attn QKV) in
@@ -77,8 +72,10 @@ class GrootN17TorchFrontendThor:
 
         self._load_weights()
 
+        self.latency_records: list[float] = []
+
     # ────────────────────────────────────────────────────────────────
-    # Weight loading (Phase 3c.a)
+    # Weight loading
     # ────────────────────────────────────────────────────────────────
 
     def _load_fmha_strided(self) -> None:
@@ -227,11 +224,7 @@ class GrootN17TorchFrontendThor:
         self._fp16_shadow_weights = shadow
 
     # ────────────────────────────────────────────────────────────────
-    # Phase 3c.b/c/d — pending
-    # ────────────────────────────────────────────────────────────────
-
-    # ────────────────────────────────────────────────────────────────
-    # Phase 3c.b2 — set_prompt
+    # Prompt setup
     # ────────────────────────────────────────────────────────────────
 
     def set_prompt(
@@ -242,8 +235,8 @@ class GrootN17TorchFrontendThor:
     ) -> None:
         """Run the calibration shadow + bake FP8 alphas + cache.
 
-        For 3c.b2 ``aux`` is the bundle of HF-derived setup tensors (the
-        same shape produced by ``tests/_helpers/groot_n17/capture_llm_aux.py``):
+        ``aux`` is the bundle of HF-derived setup tensors (the same shape
+        produced by ``tests/_helpers/groot_n17/capture_llm_aux.py``):
 
           * ``input_ids``           — (1, S)  int64
           * ``visual_pos_masks``    — (1, S)  bool
@@ -252,11 +245,6 @@ class GrootN17TorchFrontendThor:
           * ``llm_input_embeds``    — (1, S, 2048) fp32 (input to truncated LLM)
           * ``pixel_features``      — (S_vit=1024, 1024) fp32 (post-patch_embed+pos_embed)
           * ``grid_thw``            — (num_views, 3) int64
-
-        A future revision (3c.c+) will derive ``aux`` end-to-end from raw
-        ``(prompt, sample_obs)`` via the HF Qwen3VL processor + vision
-        model. For 3c.b2 we accept the pre-captured form so the calibration
-        path can land independently of the production preprocessing path.
 
         After this call, the frontend has:
 
@@ -345,6 +333,7 @@ class GrootN17TorchFrontendThor:
             self._warmup_infer()
         except Exception as e:
             warnings.warn(f"set_prompt warmup failed (non-fatal): {e!r}")
+        self.latency_records.clear()
 
     def _warmup_infer(self) -> None:
         """Single dry-run infer to prime cuBLAS / lazy-init DiT attn."""
@@ -354,7 +343,7 @@ class GrootN17TorchFrontendThor:
         _ = self.infer(warm_state, initial_noise=warm_noise)
 
     # ────────────────────────────────────────────────────────────────
-    # Phase 3c.d — CUDA Graph capture of the 32-layer DiT inner loop
+    # CUDA Graph capture
     # ────────────────────────────────────────────────────────────────
 
     def _precompute_diffusion_modulators(
@@ -621,7 +610,11 @@ class GrootN17TorchFrontendThor:
                 act_fc2[li] = max(act_fc2[li], float(ff_t[:Sa].abs().max().item()))
             post_fwd(step, 0)
 
-        # Quantize FFN weights to FP8 (per-tensor) + compose alphas/act-scales.
+        fp8_layout = select_fp8_layout(getattr(self, "hardware", None), None)
+
+        # Quantize FFN weights to FP8 (per-tensor). The SM120-safe path keeps
+        # the legacy descale+epilogue contract; the SM89 path carries explicit
+        # act/weight scales and dispatches the GEMM by layout.
         FP8_MAX = 448.0
         f8 = torch.float8_e4m3fn
         self._k_xn_fp8 = torch.empty(Sa, 1536, dtype=f8, device=dev)
@@ -633,15 +626,19 @@ class GrootN17TorchFrontendThor:
         proj_fp8, down_fp8, projb16 = [], [], []
         proj_ws, down_fp8_nt, down_ws = [], [], []
         a_fc1, a_fc2, s_fc1, s_fc2 = [], [], [], []
+        w_fc1, w_fc2 = [], []
         for li in range(32):
             pw = self._dit_ff_proj_w[li].float()
             dw = self._dit_ff_down_w[li].float()
             ws_p = pw.abs().max().item() / FP8_MAX
             ws_d = dw.abs().max().item() / FP8_MAX
+            if (not use_sm120_safe) and fp8_layout == "nk":
+                pw = pw.t().contiguous()
+                dw = dw.t().contiguous()
             pf = (pw / ws_p).to(f8).contiguous()
             df = (dw / ws_d).to(f8).contiguous()
-            # fp8_nn_gelu_bias outputs fp16 → its bias must be fp16.
-            pb = self._dit_ff_proj_b[li].half().contiguous()
+            pb = (self._dit_ff_proj_b[li].half().contiguous() if use_sm120_safe
+                  else self._dit_ff_proj_b[li].bfloat16().contiguous())
             sf1 = torch.tensor([act_fc1[li] / FP8_MAX], dtype=torch.float32, device=dev)
             sf2 = torch.tensor([act_fc2[li] / FP8_MAX], dtype=torch.float32, device=dev)
             self._dit_ff_fp8_keep += [pf, df, pb, sf1, sf2]
@@ -656,6 +653,13 @@ class GrootN17TorchFrontendThor:
                 proj_ws.append(sw_p.data_ptr())
                 down_fp8_nt.append(df_nt.data_ptr())
                 down_ws.append(sw_d.data_ptr())
+            else:
+                self._dit_ff_fp8_keep += [
+                    torch.tensor([ws_p], dtype=torch.float32, device=dev),
+                    torch.tensor([ws_d], dtype=torch.float32, device=dev),
+                ]
+                w_fc1.append(self._dit_ff_fp8_keep[-2].data_ptr())
+                w_fc2.append(self._dit_ff_fp8_keep[-1].data_ptr())
             a_fc1.append((act_fc1[li] / FP8_MAX) * ws_p)
             a_fc2.append((act_fc2[li] / FP8_MAX) * ws_d)
         # Fused FP8 QKV for the 16 self-attn layers: concat q/k/v ([D,D] each)
@@ -663,11 +667,14 @@ class GrootN17TorchFrontendThor:
         self._k_qkv_buf = torch.empty(Sa, 3 * 1536, dtype=torch.bfloat16, device=dev)
         self._k_qkv_xn_fp8 = torch.empty(Sa, 1536, dtype=f8, device=dev)
         qkv_fp8, qkv_fp8_nt, qkv_b, a_qkv, s_qkv, qkv_ws = [], [], [], [], [], []
+        w_qkv = []
         for j in range(16):
             li = 2 * j + 1
             qw = torch.cat([self._dit_q_w[li], self._dit_k_w[li], self._dit_v_w[li]], dim=1).float()
             qb = torch.cat([self._dit_q_b[li], self._dit_k_b[li], self._dit_v_b[li]]).to(torch.bfloat16).contiguous()
             ws_q = qw.abs().max().item() / FP8_MAX
+            if (not use_sm120_safe) and fp8_layout == "nk":
+                qw = qw.t().contiguous()
             qf = (qw / ws_q).to(f8).contiguous()
             sq = torch.tensor([act_qkv[j] / FP8_MAX], dtype=torch.float32, device=dev)
             self._dit_ff_fp8_keep += [qf, qb, sq]
@@ -678,6 +685,10 @@ class GrootN17TorchFrontendThor:
                 self._dit_ff_fp8_keep += [qf_nt, sw_q]
                 qkv_fp8_nt.append(qf_nt.data_ptr())
                 qkv_ws.append(sw_q.data_ptr())
+            else:
+                wq = torch.tensor([ws_q], dtype=torch.float32, device=dev)
+                self._dit_ff_fp8_keep.append(wq)
+                w_qkv.append(wq.data_ptr())
             a_qkv.append((act_qkv[j] / FP8_MAX) * ws_q)
         for step in range(num_inference_timesteps):
             if use_sm120_safe:
@@ -696,11 +707,13 @@ class GrootN17TorchFrontendThor:
             else:
                 step_weights[step].update(
                     ff_proj_w_fp8=proj_fp8, ff_down_w_fp8=down_fp8,
-                    ff_proj_b=projb16,  # fp16 bias for the GELU epilogue
-                    alpha_fc1=a_fc1, alpha_fc2=a_fc2,
+                    ff_proj_b=projb16,
                     act_fc1_scale=s_fc1, act_fc2_scale=s_fc2,
+                    w_fc1_scale=w_fc1, w_fc2_scale=w_fc2,
+                    ff_fp8_layout=fp8_layout,
                     qkv_w_fp8=qkv_fp8, qkv_b=qkv_b,
-                    alpha_qkv=a_qkv, act_qkv_scale=s_qkv)
+                    act_qkv_scale=s_qkv, w_qkv_scale=w_qkv,
+                    qkv_fp8_layout=fp8_layout)
         bp.update(xn_fp8=self._k_xn_fp8.data_ptr(),
                   ff_fp16=self._k_ff_fp16.data_ptr(),
                   ff_fp8=self._k_ff_fp8.data_ptr(),
@@ -1183,7 +1196,7 @@ class GrootN17TorchFrontendThor:
         return spec
 
     # ────────────────────────────────────────────────────────────────
-    # Phase 3c.c — eager infer (4-step flow-matching diffusion loop)
+    # Inference (4-step flow-matching diffusion loop)
     # ────────────────────────────────────────────────────────────────
 
     def infer(
@@ -1206,6 +1219,7 @@ class GrootN17TorchFrontendThor:
         if not hasattr(self, "_backbone_features"):
             raise RuntimeError("call set_prompt before infer")
 
+        t0 = time.perf_counter()
         device = self.device
         D = 1536
         action_dim = 132
@@ -1237,6 +1251,9 @@ class GrootN17TorchFrontendThor:
                     self._k_actions.copy_(torch.randn(
                         action_horizon, action_dim, dtype=torch.bfloat16, device=device))
                 self._k_dit_graph.replay()
+                torch.cuda.synchronize()
+                self.latency_records.append(
+                    (time.perf_counter() - t0) * 1000)
                 return self._k_actions.float().view(1, action_horizon, action_dim)
 
         # Eager fallback: torch cross-KV from backbone (graph path refreshes
@@ -1342,10 +1359,12 @@ class GrootN17TorchFrontendThor:
             # ── Euler step ──────────────────────────────────────────────
             actions = actions + (dt * velocity).to(actions.dtype)
 
+        torch.cuda.synchronize()
+        self.latency_records.append((time.perf_counter() - t0) * 1000)
         return actions.float()
 
     # ────────────────────────────────────────────────────────────────
-    # Internal helpers (eager; will be CUDA-graph wrapped in 3c.d)
+    # Internal helpers
     # ────────────────────────────────────────────────────────────────
 
     def _precompute_dit_cross_kv(self) -> None:
@@ -1512,9 +1531,7 @@ class GrootN17TorchFrontendThor:
         return shifts, scales
 
     def _run_state_encode(self, state_flat: torch.Tensor) -> torch.Tensor:
-        """state (1, 1, 132) → state_features (1, 1, 1536) bf16. Pure PyTorch
-        for 3c.c eager mode (small MLP; perf-irrelevant). bf16 matches the
-        ckpt's native dtype and the DiT main path."""
+        """state (1, 1, 132) → state_features (1, 1, 1536) bf16."""
         x = state_flat.view(1, 132).float()
         h = x @ self._st_enc_l1_W.float() + self._st_enc_l1_b.float()
         h = torch.nn.functional.relu(h)
@@ -1837,5 +1854,18 @@ class GrootN17TorchFrontendThor:
     def predict(self, *args, **kwargs):
         return self.infer(*args, **kwargs)
 
-    def get_latency_stats(self):
-        raise NotImplementedError("Phase 3c.d: latency stats")
+    def get_latency_stats(self) -> dict:
+        if not self.latency_records:
+            return {}
+        import numpy as np
+        lat = np.array(self.latency_records)
+        return {
+            "count": len(lat),
+            "mean_ms": float(np.mean(lat)),
+            "std_ms": float(np.std(lat)),
+            "min_ms": float(np.min(lat)),
+            "max_ms": float(np.max(lat)),
+            "p50_ms": float(np.percentile(lat, 50)),
+            "p95_ms": float(np.percentile(lat, 95)),
+            "hz": float(1000 / np.mean(lat)),
+        }

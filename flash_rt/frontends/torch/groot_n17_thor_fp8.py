@@ -207,6 +207,7 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
             self._warmup_infer()
         except Exception as e:  # noqa: BLE001
             warnings.warn(f"set_prompt warmup failed (non-fatal): {e!r}")
+        self.latency_records.clear()
 
     # ── Patch embed (image → ViT input), kernelized ───────────────────────
     def _fast_pos_embed_interpolate(self, grid_thw) -> "torch.Tensor":
