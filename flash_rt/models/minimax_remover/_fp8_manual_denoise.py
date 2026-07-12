@@ -59,8 +59,6 @@ import logging
 import os
 
 import torch
-from einops import rearrange
-from diffusers.utils.torch_utils import randn_tensor
 
 from ._kernels import (ada_layernorm_fp16_io, euler_step_inplace, mask_mul,
                        latent_normalize, latent_denormalize)

@@ -118,6 +118,38 @@ def test_manual_fused_block_uses_shared_attention_forward():
     assert "attention_forward(q, k, v, scale, _attention_mode())" in src
 
 
+def test_runtime_optional_dependencies_are_lazy_imported():
+    """Package import must not require diffusers/einops."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    for rel in (
+        "flash_rt/models/minimax_remover/_fp8_pipeline.py",
+        "flash_rt/models/minimax_remover/_fp8_manual_denoise.py",
+        "flash_rt/models/minimax_remover/_manual_denoise.py",
+    ):
+        src = (root / rel).read_text()
+        assert "from diffusers" not in "\n".join(
+            line for line in src.splitlines()[:80])
+        assert "from einops" not in "\n".join(
+            line for line in src.splitlines()[:80])
+    fp8_src = (root / "flash_rt/models/minimax_remover/_fp8_pipeline.py").read_text()
+    top_level = fp8_src.split("class MiniMaxRemoverPipelineFP8:", 1)[0]
+    assert "_fp8_manual_denoise import FP8ManualDenoise" not in top_level
+
+
+def test_minimax_remover_cmake_requires_blackwell_nvfp4():
+    """The standalone MiniMax module contains SM120 FP8/NVFP4 kernels."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    cmake = (root / "CMakeLists.txt").read_text()
+    start = cmake.index("if(FLASHRT_ENABLE_MINIMAX_REMOVER AND NOT ENABLE_NVFP4)")
+    end = cmake.index("endif()", start)
+    block = cmake[start:end]
+    assert "FLASHRT_ENABLE_MINIMAX_REMOVER requires Blackwell NVFP4" in block
+
+
 # ── 2. load_*_kernels validate the kernel surface ──
 
 def test_load_nvfp4_kernels_raises_when_symbols_absent():

@@ -15,14 +15,11 @@ import logging
 import os
 
 import torch
-from einops import rearrange
-from diffusers.utils.torch_utils import randn_tensor
 
 logger = logging.getLogger(__name__)
 
 from flash_rt.models.minimax_remover._utils import load_fp8_kernels
 from flash_rt.models.minimax_remover._kernels import mask_mul
-from flash_rt.models.minimax_remover._fp8_manual_denoise import FP8ManualDenoise
 
 
 def _import_runtime_fp8():
@@ -99,6 +96,9 @@ class MiniMaxRemoverPipelineFP8:
                     n_attn)
 
         self._orig_pipe_call = self.pipe.__call__
+        from flash_rt.models.minimax_remover._fp8_manual_denoise import (
+            FP8ManualDenoise,
+        )
 
         # Manual graph-capturable denoise (used once calibrated + when
         # FLASHRT_FP8_GRAPH=1). Lazily captures a CUDA Graph per latent shape.
@@ -186,12 +186,14 @@ class MiniMaxRemoverPipelineFP8:
         num_latent_frames = (num_frames - 1) // vsft + 1
         shape = (1, num_channels_latents, num_latent_frames,
                  height // vsfs, width // vsfs)
+        from diffusers.utils.torch_utils import randn_tensor
         latents = randn_tensor(shape, generator=generator, device=device,
                                dtype=self._dtype)
 
         masks_t = pipe.expand_masks(masks, iterations)
         masks_t = pipe.resize(masks_t, height, width).to(device).to(self._vae_dtype)
         masks_t[masks_t > 0] = 1
+        from einops import rearrange
         images_t = rearrange(images, "f h w c -> c f h w")
         images_t = pipe.resize(images_t[None, ...], height, width).to(device).to(self._vae_dtype)
         masked_images = mask_mul(images_t, masks_t)

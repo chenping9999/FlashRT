@@ -170,11 +170,17 @@ option(FLASHRT_ENABLE_MELBAND_ROFORMER
 # Enable explicitly on a Blackwell (sm_120) build.
 option(FLASHRT_ENABLE_OMNIVOICE
        "Build OmniVoice TTS RTX SM120 fused kernels in flash_rt_omnivoice" OFF)
-# MiniMax-Remover — builds flash_rt_minimax_remover.so with fp16-native
-# fused RMS_norm + RMS_SiLU CUDA kernels for the Wan VAE.  OFF by default;
-# enable with -DFLASHRT_ENABLE_MINIMAX_REMOVER=ON.
+# MiniMax-Remover — builds flash_rt_minimax_remover.so with model-specific
+# FP8/NVFP4 transformer and VAE fused kernels. OFF by default; enable with
+# -DFLASHRT_ENABLE_MINIMAX_REMOVER=ON on Blackwell only.
 option(FLASHRT_ENABLE_MINIMAX_REMOVER
-       "Build MiniMax-Remover VAE fused fp16 kernels in flash_rt_minimax_remover" OFF)
+       "Build MiniMax-Remover FP8/NVFP4 kernels in flash_rt_minimax_remover" OFF)
+if(FLASHRT_ENABLE_MINIMAX_REMOVER AND NOT ENABLE_NVFP4)
+  message(FATAL_ERROR
+    "FLASHRT_ENABLE_MINIMAX_REMOVER requires Blackwell NVFP4 support "
+    "(GPU_ARCH=120/120a/121/121a). The MiniMax-Remover module contains "
+    "SM120 FP8/NVFP4 kernels and must not be enabled for GPU_ARCH=${GPU_ARCH}.")
+endif()
 option(FLASHRT_ENABLE_SM120_DEV_KERNELS
        "Build SM120 probe/tilesweep tuning kernels and public bindings" OFF)
 # ── Slim build for VLA deployments ──
@@ -1012,11 +1018,11 @@ else()
   message(STATUS "OmniVoice TTS SM120 kernels: DISABLED")
 endif()
 
-# ── MiniMax-Remover VAE fused kernels (standalone module, independent
+# ── MiniMax-Remover fused kernels (standalone module, independent
 #    of flash_rt_kernels) ──
-# Builds flash_rt_minimax_remover.so with fp16-native fused RMS_norm and
-# RMS_norm+SiLU CUDA kernels for the Wan VAE decoder/encoder.  The module
-# is opt-in and remains separate from the default flash_rt_kernels target.
+# Builds flash_rt_minimax_remover.so with MiniMax-specific FP8/NVFP4
+# transformer kernels plus fused VAE helpers. The module is opt-in and
+# remains separate from the default flash_rt_kernels target.
 # Enable explicitly on a Blackwell (sm_120) build:
 #   cmake -DFLASHRT_ENABLE_MINIMAX_REMOVER=ON -DGPU_ARCH=120 ...
 if(FLASHRT_ENABLE_MINIMAX_REMOVER)
@@ -1052,9 +1058,9 @@ if(FLASHRT_ENABLE_MINIMAX_REMOVER)
     >)
   target_link_libraries(flash_rt_minimax_remover PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt)
   install(TARGETS flash_rt_minimax_remover LIBRARY DESTINATION flash_rt)
-  message(STATUS "MiniMax-Remover VAE fused kernels: ENABLED")
+  message(STATUS "MiniMax-Remover FP8/NVFP4 kernels: ENABLED")
 else()
-  message(STATUS "MiniMax-Remover VAE fused kernels: DISABLED")
+  message(STATUS "MiniMax-Remover FP8/NVFP4 kernels: DISABLED")
 endif()
 
 if(FLASHRT_BUILD_QWEN3_VL)
