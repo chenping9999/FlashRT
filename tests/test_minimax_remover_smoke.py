@@ -558,8 +558,49 @@ def test_quickstart_teacache_default_and_reference_guard():
     # FlashRT optimisations (no need to also pass --no-vae-opt).
     assert "vae_opt = args.vae_opt and not args.no_flashrt" in src
     # TeaCache is never applied on the reference path (ground truth = full
-    # N-step denoise for PSNR/timing A/B).
-    assert "if args.teacache_skip.strip() and not args.no_flashrt:" in src
+    # N-step denoise for PSNR/timing A/B) nor on the NVFP4 transformer
+    # path (its wrapper does not accept skip_steps).
+    assert ("if args.teacache_skip.strip() and not args.no_flashrt "
+            "and not args.nvfp4_transformer:") in src
+
+
+# ── 6. --nvfp4-transformer naming (replaces the confusing --use-fp4) ──
+
+def test_quickstart_nvfp4_transformer_flag_naming():
+    """The transformer-NVFP4 flag is named --nvfp4-transformer, not --use-fp4.
+
+    The old ``--use-fp4`` name was misleading because the default path
+    *already* uses NVFP4 for the VAE. The renamed flag makes explicit that
+    it switches the **transformer** (the 12-step iterative denoise, where
+    FP4 error accumulates) — distinct from the always-on NVFP4 VAE.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "examples/minimax_remover_quickstart.py").read_text()
+
+    # New flag is present...
+    assert '"--nvfp4-transformer"' in src
+    assert "args.nvfp4_transformer" in src
+    # ...and the old confusing name is gone from the quickstart.
+    assert '"--use-fp4"' not in src
+    assert "args.use_fp4" not in src
+    # The NVFP4 VAE install is gated on the new attribute.
+    assert "not args.nvfp4_transformer and not args.no_nvfp4_vae" in src
+
+
+def test_quickstart_nvfp4_transformer_excludes_nvfp4_vae():
+    """--nvfp4-transformer disables the NVFP4 VAE (the two NVFP4 paths are
+    mutually exclusive: VAE NVFP4 is validated only on the FP8 transformer
+    path, and the NVFP4 transformer path is a standalone small-region
+    experiment)."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "examples/minimax_remover_quickstart.py").read_text()
+
+    # nvfp4_vae is False when nvfp4_transformer is set.
+    assert "nvfp4_vae = (vae_opt and not args.nvfp4_transformer" in src
 
 
 # ── 4. Gated build: required symbols present and callable ──

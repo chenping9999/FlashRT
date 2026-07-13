@@ -11,7 +11,7 @@ This is a FlashRT optimization of the upstream project:
 
 It wraps a loaded diffusers MiniMax-Remover pipeline with
 ``flash_rt.models.minimax_remover.MiniMaxRemoverPipelineFP8`` (default) or
-``MiniMaxRemoverPipeline`` (NVFP4, --use-fp4). The FP8 path rewrites the
+``MiniMaxRemoverPipeline`` (NVFP4 transformer, --nvfp4-transformer). The FP8 path rewrites the
 transformer denoise path onto FP8 (W8A8) GEMMs with static calibration,
 fused norm/RoPE/gelu kernels and kernel attention; the NVFP4 path adds a
 graph-captured manual flow-matching loop. FP8 stays close to the fp16
@@ -59,9 +59,17 @@ Run
 ------------------------------------------------------------------
 Precision note
 ------------------------------------------------------------------
-NVFP4 (W4A4) is calibrated for the model's large GEMMs. The fused
-norm/RoPE kernels keep the precision-critical path fp32-stat. For
-large full-frame latents, 4-bit weight/activation quantisation can
+The default path uses FP8 (W8A8) for the transformer and NVFP4 (W4A4)
+for the VAE conv layers. The NVFP4 VAE is safe because the VAE is a
+single-pass encoder/decoder (no error accumulation).
+
+`--nvfp4-transformer` additionally switches the TRANSFORMER to NVFP4
+(W4A4). The 12-step iterative denoise accumulates FP4 error, so
+full-frame latents drift to black (cosine ~0.0). Only use it for small
+cropped regions (bbox crop) where per-block error stays bounded.
+
+The fused norm/RoPE kernels keep the precision-critical path fp32-stat.
+For large full-frame latents, 4-bit weight/activation quantisation can
 accumulate small per-block error; if you observe colour drift on a
 high-resolution full-frame job, prefer the bbox-cropped regime (crop
 to the mask region before inference) where the quantisation grid is
@@ -600,13 +608,14 @@ def parse_args() -> argparse.Namespace:
                    help="Denoise steps (default 12).")
     p.add_argument("--no-flashrt", action="store_true",
                    help="Run the reference diffusers path instead of FlashRT (for diffing).")
-    p.add_argument("--use-fp4", action="store_true",
-                   help="Use NVFP4 (W4A4) instead of the default FP8 (W8A8). "
-                        "NVFP4 is only calibrated for small cropped regions "
-                        "(bbox crop); full-frame inpainting will produce "
-                        "black/drift outputs. FP8 (default) is recommended "
-                        "for full-frame inpainting (end-to-end cosine >= 0.999, "
-                        "PSNR ~35-41 dB vs fp16).")
+    p.add_argument("--nvfp4-transformer", action="store_true",
+                   help="Switch the TRANSFORMER to NVFP4 (W4A4) instead of the "
+                        "default FP8 (W8A8). Note: the default path already uses "
+                        "NVFP4 for the VAE (single-pass, error-free); this flag "
+                        "adds NVFP4 to the 12-step iterative transformer denoise, "
+                        "where FP4 error accumulates and breaks full-frame "
+                        "outputs (cosine ~0.0, drifts to black). Only calibrated "
+                        "for small cropped regions (bbox crop). (default: off)")
     p.add_argument("--vae-opt", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="Apply FlashRT VAE optimisations: fused fp16 RMS_norm "
@@ -694,7 +703,7 @@ def main() -> None:
     # caching) so the run is a vanilla fp16 diffusers ground truth — the
     # baseline for PSNR/timing A/B. Users need not also pass --no-vae-opt.
     vae_opt = args.vae_opt and not args.no_flashrt
-    nvfp4_vae = (vae_opt and not args.use_fp4 and not args.no_nvfp4_vae)
+    nvfp4_vae = (vae_opt and not args.nvfp4_transformer and not args.no_nvfp4_vae)
 
     if vae_opt:
         from flash_rt.models.minimax_remover._vae_opt import install_vae_optimizations
@@ -712,10 +721,10 @@ def main() -> None:
     if args.no_flashrt:
         runner = pipe
         tag = "reference (diffusers fp16)"
-    elif args.use_fp4:
+    elif args.nvfp4_transformer:
         from flash_rt.models.minimax_remover import MiniMaxRemoverPipeline
         runner = MiniMaxRemoverPipeline(pipe)
-        tag = "FlashRT NVFP4 W4A4 (small-region only)"
+        tag = "FlashRT NVFP4 W4A4 transformer (small-region only)"
     else:
         from flash_rt.models.minimax_remover import MiniMaxRemoverPipelineFP8
         runner = MiniMaxRemoverPipelineFP8(pipe)
@@ -727,11 +736,12 @@ def main() -> None:
     masks_infer = torch.from_numpy(masks_padded.astype(np.float32))
 
     skip_steps = None
-    # TeaCache only applies to the FlashRT paths. The `--no-flashrt`
+    # TeaCache only applies to the FlashRT FP8 path. The `--no-flashrt`
     # reference is the fp16 ground truth (full N-step denoise) used for
     # PSNR/timing A/B, so never skip steps there even if --teacache-skip
-    # carries its default value.
-    if args.teacache_skip.strip() and not args.no_flashrt:
+    # carries its default value. The `--nvfp4-transformer` NVFP4 wrapper
+    # does not accept skip_steps, so it is also excluded.
+    if args.teacache_skip.strip() and not args.no_flashrt and not args.nvfp4_transformer:
         skip_steps = sorted({int(s) for s in args.teacache_skip.split(",") if s.strip()})
 
     print(f"  running inference [{tag}] (all frames at once)...")
