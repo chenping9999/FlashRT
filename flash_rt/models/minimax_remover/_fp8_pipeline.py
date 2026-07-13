@@ -121,6 +121,13 @@ class MiniMaxRemoverPipelineFP8:
         benefits from the fused path instead of only multi-call ones.
         The cost is a single CPU sync (~1 ms) after step 1.
 
+        ``skip_steps`` (optional list of int) enables training-free
+        TeaCache step caching: the listed denoise steps reuse the cached
+        noise prediction instead of running the transformer, mirroring
+        the Motus/Cosmos3 TeaCache mechanism. On the first call it is
+        forwarded to the diffusers reference loop; on steady-state calls
+        it is forwarded to the FP8 manual denoise loop.
+
         When ``FLASHRT_FP8_GRAPH=1`` and scales are frozen (call 2+), the
         denoise loop runs via the manual graph-capturable path
         (``_manual_call`` -> ``FP8ManualDenoise``). The first call always
@@ -128,6 +135,10 @@ class MiniMaxRemoverPipelineFP8:
         the second call and replayed thereafter.
         """
         use_graph = os.environ.get("FLASHRT_FP8_GRAPH", "0") == "1"
+        skip_steps = kwargs.pop("skip_steps", None)
+        fwd_kwargs = dict(kwargs)
+        if skip_steps is not None:
+            fwd_kwargs["skip_steps"] = skip_steps
         if not self._calibrated:
             logger.info("MiniMax-Remover FP8: calibration mode "
                         "(first call, dynamic FP8 + amax accumulation; "
@@ -150,27 +161,29 @@ class MiniMaxRemoverPipelineFP8:
             handle = self.transformer.register_forward_hook(
                 _freeze_after_step1)
             try:
-                result = self._orig_pipe_call(*args, **kwargs)
+                result = self._orig_pipe_call(*args, **fwd_kwargs)
             finally:
                 handle.remove()
         elif use_graph:
             # Frozen scales + graph requested: manual graph-capturable path.
-            result = self._manual_call(*args, use_graph=True, **kwargs)
+            result = self._manual_call(*args, use_graph=True,
+                                       skip_steps=skip_steps, **kwargs)
         elif os.environ.get("FLASHRT_FP8_EAGER_MANUAL", "1") == "1":
             # Steady-state: eager manual denoise (avoids the per-step
             # torch.cat of [latents, masked, masks] and the scheduler.step
             # CPU sync of the diffusers path). masked/masks latents are
             # constant across steps; _denoise_loop_body copies only the
             # changing latents slice into a persistent concat buffer.
-            result = self._manual_call(*args, use_graph=False, **kwargs)
+            result = self._manual_call(*args, use_graph=False,
+                                       skip_steps=skip_steps, **kwargs)
         else:
-            result = self._orig_pipe_call(*args, **kwargs)
+            result = self._orig_pipe_call(*args, **fwd_kwargs)
         return result
 
     @torch.no_grad()
     def _manual_call(self, images, masks, num_frames, height, width,
                      num_inference_steps=12, generator=None, iterations=16,
-                     output_type="np", use_graph=False):
+                     output_type="np", use_graph=False, skip_steps=None):
         """Manual encode + graph-denoise + decode (mirrors the diffusers
         ``MinimaxRemoverPipeline.__call__`` but replaces the denoise loop
         with the CUDA-graph-capturable ``FP8ManualDenoise``). Requires
@@ -214,7 +227,7 @@ class MiniMaxRemoverPipelineFP8:
 
         result_latents = self._graph_denoise.denoise(
             latents, masked_latents, masks_latents, num_inference_steps,
-            use_graph=use_graph)
+            use_graph=use_graph, skip_steps=skip_steps)
 
         result_latents = (result_latents.to(self._vae_dtype) / latents_std
                           + latents_mean)

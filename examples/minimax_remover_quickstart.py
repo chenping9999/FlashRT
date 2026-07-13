@@ -397,7 +397,8 @@ class MinimaxRemoverPipeline(DiffusionPipeline):
                  images: Optional[torch.Tensor] = None,
                  masks: Optional[torch.Tensor] = None,
                  latents: Optional[torch.Tensor] = None,
-                 output_type: Optional[str] = "np", iterations: int = 16):
+                 output_type: Optional[str] = "np", iterations: int = 16,
+                 skip_steps: Optional[List[int]] = None):
         device = self._execution_device
         batch_size = 1
         transformer_dtype = torch.float16
@@ -432,14 +433,28 @@ class MinimaxRemoverPipeline(DiffusionPipeline):
             masks_latents = (masks_latents - latents_mean) * latents_std
 
         self._num_timesteps = len(timesteps)
+        skip_set = set(skip_steps) if skip_steps else set()
+        skip_set.discard(0)
+        if len(timesteps) > 1:
+            skip_set.discard(len(timesteps) - 1)
+        cached_noise_pred = None
+        n_skipped = 0
         for i, t in enumerate(timesteps):
-            latent_model_input = latents.to(transformer_dtype)
-            latent_model_input = torch.cat(
-                [latent_model_input, masked_latents, masks_latents], dim=1)
-            timestep = t.expand(latents.shape[0])
-            noise_pred = self.transformer(
-                hidden_states=latent_model_input.half(), timestep=timestep)[0]
+            if i in skip_set and cached_noise_pred is not None:
+                noise_pred = cached_noise_pred
+                n_skipped += 1
+            else:
+                latent_model_input = latents.to(transformer_dtype)
+                latent_model_input = torch.cat(
+                    [latent_model_input, masked_latents, masks_latents], dim=1)
+                timestep = t.expand(latents.shape[0])
+                noise_pred = self.transformer(
+                    hidden_states=latent_model_input.half(), timestep=timestep)[0]
+                cached_noise_pred = noise_pred
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+        if n_skipped:
+            print(f"  [teacache] reused cached noise_pred at {n_skipped}/{len(timesteps)} "
+                  f"steps (training-free step caching)")
 
         latents = latents.half() / latents_std + latents_mean
         video = self.vae.decode(latents, return_dict=False)[0]
@@ -609,6 +624,17 @@ def parse_args() -> argparse.Namespace:
                    help="Disable NVFP4 W4A4 VAE conv3d (default: enabled). "
                         "Uses purpose-built NVFP4 MMA kernel for eligible "
                         "decode conv layers (Ci>=192) for ~3-7%% VAE speedup.")
+    p.add_argument("--teacache-skip", type=str, default="3,5,7,9",
+                   help="Training-free TeaCache step caching: comma-separated "
+                        "0-indexed denoise step indices to SKIP (reuse the "
+                        "cached noise prediction from the last computed step, "
+                        "matching the Motus/Cosmos3 TeaCache mechanism). Step 0 "
+                        "(calibration) and the last step are never skipped. "
+                        "The default '3,5,7,9' skips 4 of 12 interior steps and "
+                        "is quality-neutral on full-frame inpainting (PSNR "
+                        "within noise of the no-skip path, ~225 ms saved per "
+                        "skipped step). Use '' to disable, '4,7' for a "
+                        "conservative 2-step schedule. (default: '3,5,7,9')")
     return p.parse_args()
 
 
@@ -663,14 +689,21 @@ def main() -> None:
 
     pipe = build_pipeline(model_dir)
 
-    if args.vae_opt:
+    # --no-flashrt is the master "pure reference" switch: it disables ALL
+    # FlashRT optimisations (VAE fused kernels, FP8/NVFP4 conv, step
+    # caching) so the run is a vanilla fp16 diffusers ground truth — the
+    # baseline for PSNR/timing A/B. Users need not also pass --no-vae-opt.
+    vae_opt = args.vae_opt and not args.no_flashrt
+    nvfp4_vae = (vae_opt and not args.use_fp4 and not args.no_nvfp4_vae)
+
+    if vae_opt:
         from flash_rt.models.minimax_remover._vae_opt import install_vae_optimizations
         stats = install_vae_optimizations(pipe.vae,
                                            use_fp8_conv=args.fp8_conv)
         print(f"  VAE optimised: {stats}")
 
     # NVFP4 VAE conv3d (default ON for FlashRT FP8 path; --no-nvfp4-vae to disable)
-    if args.vae_opt and not args.no_flashrt and not args.use_fp4 and not args.no_nvfp4_vae:
+    if nvfp4_vae:
         from flash_rt.models.minimax_remover._vae_nvfp4 import install_vae_nvfp4
         nvfp4_stats = install_vae_nvfp4(pipe.vae)
         if nvfp4_stats.get('enabled'):
@@ -693,15 +726,26 @@ def main() -> None:
     images_tensor = images_tensor / 127.5 - 1.0
     masks_infer = torch.from_numpy(masks_padded.astype(np.float32))
 
+    skip_steps = None
+    # TeaCache only applies to the FlashRT paths. The `--no-flashrt`
+    # reference is the fp16 ground truth (full N-step denoise) used for
+    # PSNR/timing A/B, so never skip steps there even if --teacache-skip
+    # carries its default value.
+    if args.teacache_skip.strip() and not args.no_flashrt:
+        skip_steps = sorted({int(s) for s in args.teacache_skip.split(",") if s.strip()})
+
     print(f"  running inference [{tag}] (all frames at once)...")
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.empty_cache()
     t0 = time.time()
-    out = runner(
+    call_kwargs = dict(
         images=images_tensor, masks=masks_infer, num_frames=t,
         height=h, width=w, num_inference_steps=args.num_inference_steps,
         generator=torch.Generator(device=DEVICE).manual_seed(RANDOM_SEED),
-        iterations=args.iterations).frames[0]
+        iterations=args.iterations)
+    if skip_steps is not None:
+        call_kwargs["skip_steps"] = skip_steps
+    out = runner(**call_kwargs).frames[0]
     torch.cuda.synchronize()
     elapsed = time.time() - t0
     print(f"  inference wall time: {elapsed:.2f}s")

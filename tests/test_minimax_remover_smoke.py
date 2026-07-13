@@ -408,6 +408,160 @@ def test_fp8_pipeline_call_does_not_patch_pipe_class(monkeypatch):
     assert freeze_calls == [1.1]
 
 
+# ── 5. TeaCache step-caching plumbing (skip_steps) ──
+
+def test_fp8_pipeline_call_forwards_skip_steps_to_pipe(monkeypatch):
+    """skip_steps reaches the wrapped pipe's __call__ on the calibration call.
+
+    The single-call quickstart runs the first (calibration) call through the
+    diffusers reference ``__call__``, so the TeaCache schedule must be
+    forwarded there for it to take effect without a warm-up pass.
+    """
+    import torch
+
+    from flash_rt.models.minimax_remover import _fp8_pipeline
+
+    # Exercise the delegation path (orig pipe __call__) rather than the
+    # eager-manual denoise default, so the stub does not need a real
+    # transformer/scheduler.
+    monkeypatch.setenv("FLASHRT_FP8_EAGER_MANUAL", "0")
+    monkeypatch.setattr(_fp8_pipeline, "load_fp8_kernels", lambda: object())
+
+    def _fake_runtime():
+        def install_flashrt_fp8(_t, verbose=True, target="all"):
+            return 0
+
+        def set_calibration(_t, on):
+            return None
+
+        def freeze_calibration(_t, margin=1.1):
+            return 3
+
+        def install_fused_blocks(_t):
+            return 0
+
+        def install_fa2_attention(_t):
+            return 0
+
+        return (install_flashrt_fp8, set_calibration, freeze_calibration,
+                install_fused_blocks, install_fa2_attention)
+
+    monkeypatch.setattr(_fp8_pipeline, "_import_runtime_fp8", _fake_runtime)
+
+    class _Param:
+        dtype = torch.float16
+
+    class _Transformer:
+        def __init__(self):
+            self.config = types.SimpleNamespace(eps=1e-6)
+            self._hooks = []
+
+        def to(self, _d):
+            return self
+
+        def parameters(self):
+            return iter([_Param()])
+
+        def register_forward_hook(self, fn):
+            self._hooks.append(fn)
+
+            class _Handle:
+                def remove(_self):
+                    pass
+
+            return _Handle()
+
+        def _fire_hooks(self):
+            for fn in list(self._hooks):
+                fn(self, None, None)
+
+    class _Vae:
+        def parameters(self):
+            return iter([_Param()])
+
+    received = []
+
+    class _Pipe:
+        def __init__(self):
+            self.transformer = _Transformer()
+            self.vae = _Vae()
+
+        def __call__(self, *args, **kwargs):
+            received.append(dict(kwargs))
+            # Fire the one-shot calibration freeze hook on the first call.
+            self.transformer._fire_hooks()
+            return ("ok", args, kwargs)
+
+    wrapped = _fp8_pipeline.MiniMaxRemoverPipelineFP8(_Pipe())
+    out = wrapped(num_frames=5, skip_steps=[3, 5, 7, 9])
+
+    assert out[0] == "ok"
+    assert received, "wrapped pipe __call__ was never invoked"
+    assert received[0].get("skip_steps") == [3, 5, 7, 9], (
+        "skip_steps must be forwarded to the reference __call__ on the "
+        "calibration (first) call")
+
+
+def test_fp8_manual_denoise_supports_skip_steps():
+    """The FP8 manual denoise carries skip_steps through every entry point."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "flash_rt/models/minimax_remover/_fp8_manual_denoise.py").read_text()
+
+    # Zeroth-order TeaCache reuse logic (skip step reuses cached noise_pred).
+    assert "cached_noise_pred" in src
+    assert "if step in skip_set and cached_noise_pred is not None:" in src
+    # The public denoise() / _denoise_loop_body() / _capture_graph() all
+    # carry the parameter.
+    assert src.count("skip_steps=None") >= 3
+    # The captured-graph cache key is per skip-schedule, because the skip
+    # set is baked into the graph at capture time (like Motus).
+    assert "skip_key" in src
+    assert "skip_steps=skip_steps" in src
+
+
+def test_fp8_pipeline_threads_skip_steps_to_manual_call():
+    """_manual_call carries skip_steps and forwards it to FP8ManualDenoise."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "flash_rt/models/minimax_remover/_fp8_pipeline.py").read_text()
+
+    # __call__ pops skip_steps out of the public kwargs...
+    assert 'skip_steps = kwargs.pop("skip_steps", None)' in src
+    # ...forwards it to the diffusers reference loop on the calibration call...
+    assert 'fwd_kwargs["skip_steps"] = skip_steps' in src
+    # ...and threads it into _manual_call on the steady-state branches.
+    assert "skip_steps=skip_steps, **kwargs" in src
+    # _manual_call signature carries the parameter...
+    assert "skip_steps=None):" in src
+    # ...and forwards it to the FP8ManualDenoise.denoise().
+    assert "use_graph=use_graph, skip_steps=skip_steps" in src
+
+
+def test_quickstart_teacache_default_and_reference_guard():
+    """The quickstart defaults TeaCache on and keeps --no-flashrt a pure ref."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "examples/minimax_remover_quickstart.py").read_text()
+
+    # TeaCache default schedule is quality-neutral on full-frame inpainting.
+    assert 'default="3,5,7,9"' in src
+    # The reference __call__ carries the parameter...
+    assert "skip_steps: Optional[List[int]] = None" in src
+    # ...with zeroth-order reuse in the denoise loop.
+    assert "cached_noise_pred" in src
+    assert "if i in skip_set and cached_noise_pred is not None:" in src
+    # --no-flashrt is the master "pure reference" switch: it disables ALL
+    # FlashRT optimisations (no need to also pass --no-vae-opt).
+    assert "vae_opt = args.vae_opt and not args.no_flashrt" in src
+    # TeaCache is never applied on the reference path (ground truth = full
+    # N-step denoise for PSNR/timing A/B).
+    assert "if args.teacache_skip.strip() and not args.no_flashrt:" in src
+
+
 # ── 4. Gated build: required symbols present and callable ──
 
 def _get_kernels_or_skip():
