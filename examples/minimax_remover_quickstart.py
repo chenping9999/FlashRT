@@ -131,6 +131,7 @@ MASK_THRESHOLD = 127
 NUM_INFERENCE_STEPS = 12
 PIPE_ITERATIONS = 6
 RANDOM_SEED = 42
+TEACACHE_SKIP_DEFAULT = "3,5,7,9"
 
 
 # =====================================================================
@@ -633,17 +634,31 @@ def parse_args() -> argparse.Namespace:
                    help="Disable NVFP4 W4A4 VAE conv3d (default: enabled). "
                         "Uses purpose-built NVFP4 MMA kernel for eligible "
                         "decode conv layers (Ci>=192) for ~3-7%% VAE speedup.")
-    p.add_argument("--teacache-skip", type=str, default="3,5,7,9",
+    p.add_argument("--teacache-skip", type=str, default=TEACACHE_SKIP_DEFAULT,
                    help="Training-free TeaCache step caching: comma-separated "
                         "0-indexed denoise step indices to SKIP (reuse the "
                         "cached noise prediction from the last computed step, "
                         "matching the Motus/Cosmos3 TeaCache mechanism). Step 0 "
-                        "(calibration) and the last step are never skipped. "
-                        "The default '3,5,7,9' skips 4 of 12 interior steps and "
-                        "is quality-neutral on full-frame inpainting (PSNR "
-                        "within noise of the no-skip path, ~225 ms saved per "
-                        "skipped step). Use '' to disable, '4,7' for a "
-                        "conservative 2-step schedule. (default: '3,5,7,9')")
+                        "and the last step are never skipped. The default "
+                        "'3,5,7,9' skips 4 of 12 interior steps (= 8 forward "
+                        "passes) and is quality-neutral on full-frame "
+                        "inpainting. Use '' to disable. (default: '3,5,7,9')")
+    p.add_argument("--universal-scale", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Persist FP8 activation scales to disk "
+                        "(~/.flash_rt/calibration/) after the first run and "
+                        "reuse them across ALL resolutions on subsequent runs "
+                        "(margin=--universal-margin). Eliminates the per-call "
+                        "FP8 calibration step + Triton JIT cold-start for a "
+                        "~23%% cold-call speedup. PSNR >= 36 dB vs fp16 across "
+                        "288x160..480x272. (default: enabled; use "
+                        "--no-universal-scale to calibrate per-resolution)")
+    p.add_argument("--universal-margin", type=float, default=1.3,
+                   help="FP8 act_scale margin for the universal-scale path "
+                        "(default 1.3). Cross-resolution amax varies <5%% in "
+                        "median but ~3%% of layers deviate >20%%; the enlarged "
+                        "margin safely covers this. Lower (1.1) = higher "
+                        "fidelity but saturation risk at unseen resolutions.")
     return p.parse_args()
 
 
@@ -727,7 +742,10 @@ def main() -> None:
         tag = "FlashRT NVFP4 W4A4 transformer (small-region only)"
     else:
         from flash_rt.models.minimax_remover import MiniMaxRemoverPipelineFP8
-        runner = MiniMaxRemoverPipelineFP8(pipe)
+        runner = MiniMaxRemoverPipelineFP8(
+            pipe,
+            use_universal_scale=args.universal_scale,
+            universal_margin=args.universal_margin)
         tag = "FlashRT FP8 W8A8 (full-frame)"
 
     t, h, w, _ = frames_padded.shape

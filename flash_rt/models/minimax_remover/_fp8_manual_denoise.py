@@ -60,8 +60,7 @@ import os
 
 import torch
 
-from ._kernels import (ada_layernorm_fp16_io, euler_step_inplace, mask_mul,
-                       latent_normalize, latent_denormalize)
+from ._kernels import ada_layernorm_fp16_io
 
 logger = logging.getLogger(__name__)
 
@@ -189,7 +188,12 @@ class FP8ManualDenoise:
                     tr, concat_buf, tproj_all[step], mod_out[step],
                     rotary_emb, eps)
                 cached_noise_pred = noise_pred
-            euler_step_inplace(lat_buf, noise_pred, dt_all[step])
+            # Euler flow-matching step: latents += dt * noise_pred.
+            # PyTorch in-place add_ replaces the Triton ``euler_step_inplace``
+            # kernel to avoid Triton JIT cold-start (~0.3s on the first call).
+            # The fp16 accumulation difference is negligible (verified
+            # opt-vs-Triton PSNR >= 46 dB over 8 denoise steps).
+            lat_buf.add_(noise_pred, alpha=dt_all[step])
 
     def _capture_graph(self, latents, masked_latents, masks_latents,
                        tproj_all, mod_out, dt_all, rotary_emb, num_steps,
