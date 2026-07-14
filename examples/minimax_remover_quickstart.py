@@ -102,6 +102,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 
+# OpenCV's PNG/JPEG encoders are faster than PIL (notably ~20% on PNG) and
+# release the GIL, so prefer cv2 when available; fall back to PIL otherwise.
+# cv2's own import is ~0.19s, so only probe for its presence here and defer
+# the actual import to _save_one (startup-critical path stays untaxed).
+import importlib.util as _ilu
+_CV2_SPEC = _ilu.find_spec("cv2")
+
 # Make the flash_rt package importable when run directly from the repo root.
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -782,19 +789,52 @@ def main() -> None:
     proc_len = out_u8.shape[0]
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    saved = inpainted = uncovered = 0
+    # Pre-build the per-frame output arrays, then fan out the (CPU-bound)
+    # PNG/JPEG encoding + disk writes across a thread pool. zlib/jpeg release
+    # the GIL while compressing, so this scales near-linearly with cores --
+    # the sequential loop below was a major fraction of end-to-end wall time.
+    tasks: List[Tuple[Path, np.ndarray, str]] = []
+    inpainted = uncovered = 0
     for local_i, path in enumerate(image_paths):
-        dst = output_dir / path.name
+        ext = path.suffix.lower()
         if local_i < proc_len and has_region[local_i]:
-            crop = out_u8[local_i, :orig_h, :orig_w, :]
-            Image.fromarray(crop, mode="RGB").save(dst)
+            tasks.append((output_dir / path.name,
+                          np.ascontiguousarray(out_u8[local_i, :orig_h, :orig_w, :]),
+                          ext))
             inpainted += 1
-        elif local_i >= proc_len and has_region[local_i]:
-            Image.fromarray(frames[local_i], mode="RGB").save(dst)
-            uncovered += 1
         else:
-            Image.fromarray(frames[local_i], mode="RGB").save(dst)
-        saved += 1
+            if local_i >= proc_len and has_region[local_i]:
+                uncovered += 1
+            tasks.append((output_dir / path.name,
+                          np.ascontiguousarray(frames[local_i]), ext))
+
+    def _save_one(task: Tuple[Path, np.ndarray, str]) -> None:
+        dst, arr, ext = task
+        if _CV2_SPEC is not None:
+            # Lazy import: cv2 is ~0.19s to import, paid once on first save
+            # rather than at process startup. Python caches it, so the cost
+            # is only incurred by the first thread; the import lock keeps
+            # concurrent threads safe.
+            import cv2
+            # cv2 expects BGR; our arrays are RGB.
+            bgr = np.ascontiguousarray(arr[:, :, ::-1])
+            if ext == ".png":
+                cv2.imwrite(str(dst), bgr, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+            else:
+                cv2.imwrite(str(dst), bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        elif ext == ".png":
+            Image.fromarray(arr).save(dst, compress_level=3)
+        else:
+            Image.fromarray(arr).save(dst, quality=95)
+
+    max_workers = max(1, min(8, (os.cpu_count() or 4), len(tasks)))
+    if len(tasks) <= 1 or max_workers <= 1:
+        for task in tasks:
+            _save_one(task)
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            list(ex.map(_save_one, tasks))
+    saved = len(tasks)
 
     peak_alloc = torch.cuda.max_memory_allocated() / 1024 ** 3
     peak_reserved = torch.cuda.max_memory_reserved() / 1024 ** 3
