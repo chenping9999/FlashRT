@@ -384,7 +384,11 @@ def test_fp8_pipeline_call_does_not_patch_pipe_class(monkeypatch):
     pipe2 = _CallablePipe("pipe2")
     original_call = _CallablePipe.__call__
 
-    wrapped = _fp8_pipeline.MiniMaxRemoverPipelineFP8(pipe1)
+    # use_universal_scale=False keeps this class-isolation test off the
+    # cross-resolution scale-cache path, which needs a realistic dict-like
+    # transformer.config and would write to ~/.flash_rt/calibration/.
+    wrapped = _fp8_pipeline.MiniMaxRemoverPipelineFP8(
+        pipe1, use_universal_scale=False)
 
     assert _CallablePipe.__call__ is original_call
     assert pipe2("unwrapped") == ("pipe2", ("unwrapped",), {})
@@ -492,7 +496,10 @@ def test_fp8_pipeline_call_forwards_skip_steps_to_pipe(monkeypatch):
             self.transformer._fire_hooks()
             return ("ok", args, kwargs)
 
-    wrapped = _fp8_pipeline.MiniMaxRemoverPipelineFP8(_Pipe())
+    # use_universal_scale=False avoids the disk-backed scale cache so this
+    # skip_steps-forwarding test stays hermetic (no ~/.flash_rt writes).
+    wrapped = _fp8_pipeline.MiniMaxRemoverPipelineFP8(
+        _Pipe(), use_universal_scale=False)
     out = wrapped(num_frames=5, skip_steps=[3, 5, 7, 9])
 
     assert out[0] == "ok"
@@ -548,7 +555,10 @@ def test_quickstart_teacache_default_and_reference_guard():
     src = (root / "examples/minimax_remover_quickstart.py").read_text()
 
     # TeaCache default schedule is quality-neutral on full-frame inpainting.
-    assert 'default="3,5,7,9"' in src
+    # The quickstart factors the default into a named constant used by the
+    # --teacache-skip argument.
+    assert 'TEACACHE_SKIP_DEFAULT = "3,5,7,9"' in src
+    assert "default=TEACACHE_SKIP_DEFAULT" in src
     # The reference __call__ carries the parameter...
     assert "skip_steps: Optional[List[int]] = None" in src
     # ...with zeroth-order reuse in the denoise loop.
